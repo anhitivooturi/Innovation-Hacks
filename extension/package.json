@@ -48,7 +48,8 @@
         },
         {
           "id": "devlogFileTree",
-          "name": "File Status"
+          "name": "File Status",
+          "type": "tree"
         }
       ]
     },
