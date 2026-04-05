@@ -3,6 +3,7 @@ DevLog AI - FastAPI Backend
 Receives file changes, logs decisions, and maintains the living devlog document.
 """
 
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -10,6 +11,10 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+# Import Gemini agent
+sys.path.append(str(Path(__file__).parent.parent))
+from agent.gemini import process_change, answer_query, generate_handoff
 
 
 # Initialize FastAPI app
@@ -163,30 +168,50 @@ async def root():
 async def receive_change(change: ChangeEvent):
     """
     Receive a file change event from the watcher.
-    Appends a plain English entry to devlog/project.md.
+    Uses Gemini to intelligently process and update the devlog.
     """
     try:
         print(f"📝 POST /change - {change.file_path} ({change.event_type})")
 
-        # Format the change as a plain English entry
-        entry = format_change_entry(change)
+        # Read current devlog
+        current_devlog = read_devlog()
 
-        # Append to devlog under "Recent Changes" section
-        append_to_devlog(entry)
+        # Use Gemini to process the change and update devlog
+        updated_devlog = process_change(
+            filepath=change.file_path,
+            diff=change.diff,
+            current_devlog=current_devlog
+        )
+
+        # Write the updated devlog
+        DEVLOG_PATH.write_text(updated_devlog, encoding='utf-8')
 
         timestamp = datetime.now().isoformat()
 
-        print(f"✅ Logged change: {change.file_path}")
+        print(f"✅ Logged change with Gemini: {change.file_path}")
 
         return StatusResponse(
             status="success",
-            message=f"Change logged: {change.file_path}",
+            message=f"Change processed: {change.file_path}",
             timestamp=timestamp
         )
 
     except Exception as e:
         print(f"❌ Error logging change: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to log change: {str(e)}")
+
+        # Fallback: append simple entry if Gemini processing fails completely
+        try:
+            entry = format_change_entry(change)
+            append_to_devlog(entry)
+            print(f"⚠️  Fallback: appended simple entry")
+
+            return StatusResponse(
+                status="success",
+                message=f"Change logged (fallback): {change.file_path}",
+                timestamp=datetime.now().isoformat()
+            )
+        except Exception as fallback_error:
+            raise HTTPException(status_code=500, detail=f"Failed to log change: {str(e)}")
 
 
 @app.get("/devlog", response_model=DevlogResponse)
@@ -216,38 +241,69 @@ async def get_devlog():
         raise HTTPException(status_code=500, detail=f"Failed to read devlog: {str(e)}")
 
 
-@app.post("/query", response_model=StatusResponse)
+@app.post("/query")
 async def query_project(query: QueryRequest):
     """
-    Ask a question about the project.
-    Placeholder for future Gemini integration.
+    Ask a question about the project using Gemini.
     """
-    print(f"🤔 POST /query - Question: {query.question}")
+    try:
+        print(f"🤔 POST /query - Question: {query.question}")
 
-    timestamp = datetime.now().isoformat()
+        # Read current devlog
+        devlog_content = read_devlog()
 
-    return StatusResponse(
-        status="success",
-        message="Query received (placeholder - Gemini integration coming soon)",
-        timestamp=timestamp
-    )
+        # Use Gemini to answer the question
+        answer = answer_query(
+            question=query.question,
+            devlog_content=devlog_content
+        )
+
+        timestamp = datetime.now().isoformat()
+
+        print(f"✅ Query answered")
+
+        return {
+            "status": "success",
+            "message": "Query answered",
+            "timestamp": timestamp,
+            "question": query.question,
+            "answer": answer
+        }
+
+    except Exception as e:
+        print(f"❌ Error answering query: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to answer query: {str(e)}")
 
 
-@app.post("/handoff", response_model=StatusResponse)
-async def generate_handoff(request: HandoffRequest):
+@app.post("/handoff")
+async def generate_handoff_doc(request: HandoffRequest):
     """
-    Generate a handoff document for the project.
-    Placeholder for future Gemini integration.
+    Generate a handoff document for the project using Gemini.
     """
-    print(f"📋 POST /handoff - Recipient: {request.recipient or 'team'}")
+    try:
+        print(f"📋 POST /handoff - Recipient: {request.recipient or 'team'}")
 
-    timestamp = datetime.now().isoformat()
+        # Read current devlog
+        devlog_content = read_devlog()
 
-    return StatusResponse(
-        status="success",
-        message="Handoff generation requested (placeholder - Gemini integration coming soon)",
-        timestamp=timestamp
-    )
+        # Use Gemini to generate handoff document
+        handoff_doc = generate_handoff(devlog_content)
+
+        timestamp = datetime.now().isoformat()
+
+        print(f"✅ Handoff document generated")
+
+        return {
+            "status": "success",
+            "message": "Handoff document generated",
+            "timestamp": timestamp,
+            "recipient": request.recipient,
+            "handoff_document": handoff_doc
+        }
+
+    except Exception as e:
+        print(f"❌ Error generating handoff: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate handoff: {str(e)}")
 
 
 @app.post("/mcp/log_decision", response_model=StatusResponse)
