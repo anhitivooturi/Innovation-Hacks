@@ -14,12 +14,24 @@ export function TimelinePanel({ entries }) {
         </div>
         <span className="inline-flex items-center gap-2 rounded-full border border-ink/10 bg-white px-4 py-2 text-sm text-ink/60">
           <Clock3 className="h-4 w-4 text-clay" />
-          Auto-refreshes when Firestore changes land
+          {entries.length > 0 ? `${entries.length} changes tracked` : 'Listening for changes...'}
         </span>
       </div>
 
       <div className="relative space-y-4 before:absolute before:left-[15px] before:top-2 before:h-[calc(100%-18px)] before:w-px before:bg-gradient-to-b before:from-clay before:to-transparent">
-        {entries.map((entry) => (
+        {entries.length === 0 ? (
+          <div className="rounded-[28px] border border-ink/10 bg-white/80 p-8 text-center shadow-panel">
+            <Clock3 className="mx-auto h-12 w-12 text-ink/20 mb-4" />
+            <p className="text-lg font-medium text-ink/60 mb-2">No changes yet</p>
+            <p className="text-sm text-ink/50 mb-3">
+              Firestore is connected and listening. Waiting for file changes...
+            </p>
+            <p className="text-xs text-ink/40">
+              Check browser console for Firestore connection logs
+            </p>
+          </div>
+        ) : (
+          entries.map((entry) => (
           <article
             key={entry.id}
             className="relative ml-10 rounded-[28px] border border-ink/10 bg-white/80 p-5 shadow-panel animate-rise"
@@ -58,7 +70,8 @@ export function TimelinePanel({ entries }) {
               ) : null}
             </div>
           </article>
-        ))}
+        ))
+        )}
       </div>
     </section>
   );

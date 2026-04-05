@@ -206,12 +206,19 @@ class DevLogWatcher(FileSystemEventHandler):
             True if successful, False otherwise
         """
         try:
+            print(f"📤 Sending to API: {self.api_url}")
+
             response = requests.post(
                 self.api_url,
                 json=payload,
-                timeout=10
+                timeout=15  # Increased timeout for Cloud Run
             )
             response.raise_for_status()
+
+            # Log successful response
+            result = response.json()
+            print(f"✅ API Response: {result.get('message', 'success')}")
+
             return True
 
         except requests.exceptions.ConnectionError:
@@ -219,11 +226,12 @@ class DevLogWatcher(FileSystemEventHandler):
             return False
 
         except requests.exceptions.Timeout:
-            print(f"❌ API timeout - request took too long")
+            print(f"❌ API timeout - request took too long (>15s)")
             return False
 
         except requests.exceptions.HTTPError as e:
             print(f"❌ API HTTP error: {e}")
+            print(f"   Response: {e.response.text if e.response else 'N/A'}")
             return False
 
         except Exception as e:
@@ -392,8 +400,14 @@ class DevLogWatcher(FileSystemEventHandler):
 
 if __name__ == "__main__":
     # Configuration
-    watch_path = "test-project"
-    api_url = "http://localhost:8000/change"
+    watch_path = os.getenv("DEVLOG_WATCH_PATH", ".")  # Current directory by default
+    api_url = os.getenv(
+        "DEVLOG_API_URL",
+        "https://devlog-backend-130030203761.us-central1.run.app/change"  # Cloud Run endpoint
+    )
+
+    print(f"📍 Using API URL: {api_url}")
+    print(f"📁 Watching path: {watch_path}")
 
     # Create and run watcher
     watcher = DevLogWatcher(watch_path, api_url)

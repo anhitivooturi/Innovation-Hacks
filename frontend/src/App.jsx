@@ -7,6 +7,9 @@ import {
   RefreshCcw,
   ShieldAlert,
   Sparkles,
+  Wifi,
+  WifiOff,
+  Loader2,
 } from 'lucide-react';
 import { TimelinePanel } from './components/TimelinePanel';
 import { DevLogPanel } from './components/DevLogPanel';
@@ -25,6 +28,7 @@ import {
 function App() {
   const {
     connectionMode,
+    connectionError,
     timeline,
     devlog,
     decisions,
@@ -43,6 +47,44 @@ function App() {
   const [isSnapshotsOpen, setIsSnapshotsOpen] = useState(false);
   const [isHandoffOpen, setIsHandoffOpen] = useState(false);
 
+  // Connection mode display
+  const connectionDisplay = useMemo(() => {
+    if (connectionMode === 'live') {
+      return {
+        value: '🔥 Live',
+        detail: 'Firestore connected',
+        icon: Wifi,
+        accent: 'text-moss',
+        bgAccent: 'bg-moss/10',
+      };
+    }
+    if (connectionMode === 'connecting') {
+      return {
+        value: 'Connecting...',
+        detail: 'Initializing Firestore',
+        icon: Loader2,
+        accent: 'text-marine animate-spin',
+        bgAccent: 'bg-marine/10',
+      };
+    }
+    if (connectionMode === 'error') {
+      return {
+        value: 'Error',
+        detail: connectionError || 'Connection failed',
+        icon: WifiOff,
+        accent: 'text-clay',
+        bgAccent: 'bg-clay/10',
+      };
+    }
+    return {
+      value: 'Unknown',
+      detail: 'Check console',
+      icon: WifiOff,
+      accent: 'text-clay',
+      bgAccent: 'bg-clay/10',
+    };
+  }, [connectionMode, connectionError]);
+
   const statCards = useMemo(
     () => [
       {
@@ -50,31 +92,89 @@ function App() {
         value: status?.projectHealth ?? 'unknown',
         icon: ShieldAlert,
         accent: 'text-moss',
+        bgAccent: 'bg-moss/10',
       },
       {
         label: 'Open todos',
         value: countOpenTodos(todos),
         icon: AlarmClockCheck,
         accent: 'text-marine',
+        bgAccent: 'bg-marine/10',
       },
       {
         label: 'Danger zones',
         value: countDangerZones(status),
         icon: BrainCircuit,
         accent: 'text-clay',
+        bgAccent: 'bg-clay/10',
       },
       {
-        label: 'Live mode',
-        value: connectionMode === 'firebase' ? 'Firestore' : 'Mock data',
-        icon: Sparkles,
-        accent: 'text-plum',
+        label: 'Connection',
+        value: connectionDisplay.value,
+        detail: connectionDisplay.detail,
+        icon: connectionDisplay.icon,
+        accent: connectionDisplay.accent,
+        bgAccent: connectionDisplay.bgAccent,
       },
     ],
-    [connectionMode, status, todos],
+    [connectionDisplay, status, todos],
   );
 
   return (
     <div className="min-h-screen bg-sand text-ink">
+      {/* Live Mode Banner */}
+      {connectionMode === 'live' && (
+        <div className="sticky top-0 z-50 border-b border-moss/20 bg-moss/10 backdrop-blur-sm animate-rise">
+          <div className="dashboard-shell py-2">
+            <div className="flex items-center justify-center gap-2 text-sm">
+              <Wifi className="h-4 w-4 text-moss" />
+              <span className="font-medium text-moss">
+                🔥 Live Mode Active - Connected to Firestore
+              </span>
+              <span className="rounded-full bg-moss/20 px-2 py-0.5 text-xs text-moss">
+                Real-time updates
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Connecting Banner */}
+      {connectionMode === 'connecting' && (
+        <div className="sticky top-0 z-50 border-b border-marine/20 bg-marine/10 backdrop-blur-sm">
+          <div className="dashboard-shell py-2">
+            <div className="flex items-center justify-center gap-2 text-sm">
+              <Loader2 className="h-4 w-4 text-marine animate-spin" />
+              <span className="font-medium text-marine">
+                Connecting to Firestore...
+              </span>
+              <span className="rounded-full bg-marine/20 px-2 py-0.5 text-xs text-marine">
+                Please wait
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Error Banner */}
+      {connectionMode === 'error' && (
+        <div className="sticky top-0 z-50 border-b border-clay/20 bg-clay/10 backdrop-blur-sm">
+          <div className="dashboard-shell py-2">
+            <div className="flex items-center justify-center gap-2 text-sm">
+              <WifiOff className="h-4 w-4 text-clay" />
+              <span className="font-medium text-clay">
+                Connection Error
+              </span>
+              {connectionError && (
+                <span className="rounded-full bg-clay/20 px-2 py-0.5 text-xs text-clay truncate max-w-xs">
+                  {connectionError}
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="dashboard-shell">
         <header className="panel relative overflow-hidden">
           <div className="absolute -right-12 top-0 h-44 w-44 rounded-full bg-gold/20 blur-3xl" />
@@ -119,14 +219,19 @@ function App() {
                     className="rounded-3xl border border-white/70 bg-white/80 p-4 shadow-panel backdrop-blur animate-rise"
                   >
                     <div className="flex items-start justify-between gap-4">
-                      <div>
+                      <div className="flex-1 min-w-0">
                         <p className="text-sm text-ink/60">{card.label}</p>
                         <p className="mt-2 text-2xl font-semibold capitalize text-ink">
                           {card.value}
                         </p>
+                        {card.detail && (
+                          <p className="mt-1 text-xs text-ink/50 truncate">
+                            {card.detail}
+                          </p>
+                        )}
                       </div>
                       <span
-                        className={`rounded-2xl bg-ink/5 p-3 ${card.accent}`}
+                        className={`rounded-2xl ${card.bgAccent || 'bg-ink/5'} p-3 ${card.accent}`}
                       >
                         <Icon className="h-5 w-5" />
                       </span>

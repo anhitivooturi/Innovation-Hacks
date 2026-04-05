@@ -5,8 +5,9 @@ Falls back to local summarization when GCP is not configured.
 """
 
 import os
+import json
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from typing import Optional
+from typing import Optional, Dict
 from datetime import datetime
 
 
@@ -69,342 +70,440 @@ def ask_gemini(prompt: str) -> str:
 
 
 # ============================================================================
-# Local Fallback Functions
+# Structured Analysis for /change endpoint
 # ============================================================================
 
-def local_process_change(filepath: str, diff: str, current_devlog: str) -> str:
+def analyze_change_with_gemini(file_path: str, content: str, diff: str) -> Dict:
     """
-    Local fallback: smart summarization without Gemini.
-    Detects change type and appends to devlog.
+    Analyze a code change and return structured JSON with specific, actionable insights.
+
+    Args:
+        file_path: Path to the changed file
+        content: Full file content
+        diff: The diff of the change
+
+    Returns:
+        Dict with structured analysis or fallback data
     """
-    print(f"📝 Local processing (no Gemini): {filepath}")
+    if not GEMINI_AVAILABLE:
+        return _fallback_analysis(file_path, diff)
 
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Build a strong, specific prompt for high-quality output
+    prompt = f"""You are DevLog AI, a code change analyzer.
 
-    # Analyze diff to determine change type
+Your job: Analyze this diff and output a CONCISE, SPECIFIC summary.
+
+RULES:
+- Mention the EXACT filename and what was done (e.g., "added function X", "fixed bug in Y")
+- Classify the change type accurately
+- Keep summary to 1-2 sentences MAX
+- NO generic phrases like "modified code" or "updated file"
+- NO repeating the diff verbatim
+- Focus on WHAT changed and WHY it matters
+
+File: {file_path}
+
+Diff:
+{diff[:1500]}
+
+{"Context (first 1000 chars):" if content else ""}
+{content[:1000] if content else ""}
+
+OUTPUT FORMAT (strict JSON, no markdown):
+{{
+  "summary": "Specific 1-2 sentence summary mentioning filename and exact change",
+  "classification": "feature | fix | refactor | breaking | config",
+  "danger": true/false,
+  "reason": "Brief explanation of impact or safety",
+  "todos": ["specific action items if needed"],
+  "affected_files": ["{file_path}"]
+}}
+
+Example good summary:
+"Added new authentication middleware in auth.py that validates JWT tokens on protected routes."
+
+Example bad summary:
+"Modified the code in auth.py to update functionality."
+
+RESPOND WITH JSON ONLY:"""
+
+    try:
+        # Call Gemini with timeout
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(ask_gemini, prompt)
+            response_text = future.result(timeout=GEMINI_TIMEOUT)
+
+        # Clean and parse response
+        result = _parse_gemini_response(response_text, file_path)
+
+        # Validate quality (no generic summaries)
+        if _is_generic_summary(result['summary']):
+            print(f"⚠️  Generic summary detected, enhancing with fallback")
+            fallback = _smart_fallback_analysis(file_path, diff)
+            result['summary'] = fallback['summary']
+
+        print(f"✅ Gemini analyzed: {file_path}")
+        return result
+
+    except (FuturesTimeoutError, json.JSONDecodeError, Exception) as e:
+        print(f"⚠️  Gemini analysis failed: {e}, using smart fallback")
+        return _smart_fallback_analysis(file_path, diff)
+
+
+def _parse_gemini_response(response_text: str, file_path: str) -> Dict:
+    """
+    Parse Gemini's JSON response, handling markdown code blocks.
+    """
+    response_text = response_text.strip()
+
+    # Remove markdown code blocks if present
+    if '```' in response_text:
+        # Extract content between first ``` and last ```
+        parts = response_text.split('```')
+        for part in parts:
+            part = part.strip()
+            if part.startswith('json'):
+                part = part[4:].strip()
+            if part.startswith('{'):
+                response_text = part
+                break
+
+    # Parse JSON
+    result = json.loads(response_text)
+
+    # Ensure required fields exist
+    if 'summary' not in result:
+        result['summary'] = f"Modified {file_path}"
+    if 'classification' not in result:
+        result['classification'] = 'modification'
+    if 'danger' not in result:
+        result['danger'] = False
+    if 'reason' not in result:
+        result['reason'] = 'Standard change'
+    if 'todos' not in result:
+        result['todos'] = []
+    if 'affected_files' not in result:
+        result['affected_files'] = [file_path]
+
+    return result
+
+
+def _is_generic_summary(summary: str) -> bool:
+    """
+    Check if summary is too generic and unhelpful.
+    """
+    generic_phrases = [
+        'modified code',
+        'updated file',
+        'changed the',
+        'modified the file',
+        'updated the code',
+        'made changes',
+        'code was modified',
+        'file was updated',
+    ]
+
+    summary_lower = summary.lower()
+    return any(phrase in summary_lower for phrase in generic_phrases)
+
+
+def _smart_fallback_analysis(file_path: str, diff: str) -> Dict:
+    """
+    Intelligent fallback that actually parses the diff to understand changes.
+    Better than just counting lines.
+    """
     lines = diff.split('\n')
-    added_lines = [l for l in lines if l.startswith('+') and not l.startswith('+++')]
-    removed_lines = [l for l in lines if l.startswith('-') and not l.startswith('---')]
+    added_lines = [l[1:].strip() for l in lines if l.startswith('+') and not l.startswith('+++')]
+    removed_lines = [l[1:].strip() for l in lines if l.startswith('-') and not l.startswith('---')]
 
     added_count = len(added_lines)
     removed_count = len(removed_lines)
 
-    # Classify change
-    if removed_count == 0 and added_count > 0:
-        change_type = "feature"
-        summary = f"Added {added_count} new lines to {filepath}"
-    elif added_count == 0 and removed_count > 0:
-        change_type = "cleanup/removal"
-        summary = f"Removed {removed_count} lines from {filepath}"
-    elif removed_count > added_count:
-        change_type = "refactor/fix"
-        summary = f"Refactored {filepath} (removed {removed_count}, added {added_count} lines)"
+    # Try to detect what kind of change this is
+    classification = 'modification'
+    summary = f"Modified {file_path}"
+    danger = False
+    reason = "Standard modification"
+
+    # Detect new functions/classes/imports
+    if any('def ' in l or 'class ' in l for l in added_lines):
+        classification = 'feature'
+        if any('def ' in l for l in added_lines):
+            func_names = [l.split('def ')[1].split('(')[0] for l in added_lines if 'def ' in l]
+            if func_names:
+                summary = f"Added new function `{func_names[0]}()` in {file_path}"
+        elif any('class ' in l for l in added_lines):
+            class_names = [l.split('class ')[1].split('(')[0].split(':')[0] for l in added_lines if 'class ' in l]
+            if class_names:
+                summary = f"Added new class `{class_names[0]}` in {file_path}"
+
+    # Detect fixes (comments or error handling)
+    elif any('fix' in l.lower() or 'bug' in l.lower() for l in added_lines):
+        classification = 'fix'
+        summary = f"Applied bug fix in {file_path}"
+
+    # Detect config changes
+    elif file_path.endswith(('.json', '.yaml', '.yml', '.toml', '.env', '.config')):
+        classification = 'config'
+        summary = f"Updated configuration in {file_path}"
+
+    # Detect breaking changes
+    elif any('def ' in l or 'class ' in l for l in removed_lines):
+        classification = 'breaking'
+        danger = True
+        summary = f"Removed function or class from {file_path} (potentially breaking)"
+        reason = "Deletion of code structure may break dependent code"
+
+    # Default: just describe the diff
     else:
-        change_type = "modification"
-        summary = f"Modified {filepath} (added {added_count}, removed {removed_count} lines)"
+        if added_count > removed_count:
+            summary = f"Added {added_count} lines to {file_path}"
+        elif removed_count > added_count:
+            summary = f"Removed {removed_count} lines from {file_path}"
+        else:
+            summary = f"Modified {added_count} lines in {file_path}"
 
-    # Detect potential danger zones
-    danger_keywords = ['auth', 'password', 'token', 'security', 'database', 'schema', 'migration', 'api']
-    is_danger = any(keyword in filepath.lower() or keyword in diff.lower() for keyword in danger_keywords)
-    danger_note = "\n⚠️  **Potential danger zone detected**" if is_danger else ""
-
-    # Build entry
-    entry = f"""
-**{timestamp}** — {change_type.upper()}: `{filepath}`
-{summary}{danger_note}
-
-"""
-
-    # Append to current devlog
-    updated_devlog = current_devlog + entry
-
-    print(f"✅ Local processing complete: {filepath}")
-    return updated_devlog
+    return {
+        "summary": summary,
+        "classification": classification,
+        "danger": danger,
+        "reason": reason,
+        "todos": [],
+        "affected_files": [file_path]
+    }
 
 
-def local_answer_query(question: str, devlog_content: str) -> str:
+def _fallback_analysis(file_path: str, diff: str) -> Dict:
     """
-    Local fallback: keyword search in devlog.
+    Basic fallback when Gemini is not available.
+    Uses smart fallback internally.
     """
-    print(f"📝 Local query (no Gemini): {question[:50]}...")
+    result = _smart_fallback_analysis(file_path, diff)
+    result['reason'] = "Gemini unavailable - using local analysis"
+    return result
 
-    # Simple keyword extraction
-    keywords = [word.lower().strip('?.,!') for word in question.split() if len(word) > 3]
 
-    # Search for matching sections
+# ============================================================================
+# Query Interface for /query endpoint
+# ============================================================================
+
+def answer_query(question: str, devlog_content: str) -> str:
+    """
+    Answer a question about the project using devlog context.
+    Returns concise, specific answers - NOT full log dumps.
+
+    Args:
+        question: User's question
+        devlog_content: Full devlog content
+
+    Returns:
+        Plain English answer (concise, specific)
+    """
+    if not GEMINI_AVAILABLE:
+        return _fallback_query_answer(question, devlog_content)
+
+    # Extract only relevant sections to keep context focused
+    relevant_context = _extract_relevant_context(question, devlog_content)
+
+    prompt = f"""You are DevLog AI, a project assistant that provides CONCISE, SPECIFIC answers.
+
+RULES:
+- Answer the question DIRECTLY
+- Be specific: mention filenames, function names, exact changes
+- Keep response to 2-3 sentences MAX
+- NO repeating entire logs or diffs
+- NO generic responses like "the project was updated"
+
+Question: {question}
+
+Project Context:
+{relevant_context}
+
+Provide a direct, specific answer:"""
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(ask_gemini, prompt)
+            answer = future.result(timeout=GEMINI_TIMEOUT)
+
+        # Validate answer quality
+        if len(answer) > 500:  # Too long, likely dumping logs
+            print("⚠️  Response too long, using fallback")
+            return _fallback_query_answer(question, devlog_content)
+
+        print(f"✅ Gemini answered query: {question[:50]}")
+        return answer.strip()
+
+    except Exception as e:
+        print(f"⚠️  Query failed: {e}")
+        return _fallback_query_answer(question, devlog_content)
+
+
+def _extract_relevant_context(question: str, devlog_content: str, max_chars: int = 3000) -> str:
+    """
+    Extract only relevant sections from devlog based on question.
+    Prevents dumping full logs into context.
+    """
+    keywords = [w.lower().strip('?.,!') for w in question.split() if len(w) > 3]
+    lines = devlog_content.split('\n')
+    relevant_lines = []
+
+    # Find lines matching keywords
+    for i, line in enumerate(lines):
+        if any(k in line.lower() for k in keywords):
+            # Include surrounding context (5 lines before/after)
+            start = max(0, i - 5)
+            end = min(len(lines), i + 6)
+            chunk = '\n'.join(lines[start:end])
+            if chunk not in relevant_lines:
+                relevant_lines.append(chunk)
+
+    # If nothing found, return recent activity
+    if not relevant_lines:
+        return '\n'.join(lines[-50:])  # Last 50 lines
+
+    # Join and truncate
+    result = '\n\n---\n\n'.join(relevant_lines)
+    return result[:max_chars]
+
+
+def _fallback_query_answer(question: str, devlog_content: str) -> str:
+    """
+    Fallback query answering using keyword search.
+    """
+    keywords = [w.lower().strip('?.,!') for w in question.split() if len(w) > 3]
     lines = devlog_content.split('\n')
     matches = []
 
     for i, line in enumerate(lines):
-        line_lower = line.lower()
-        if any(keyword in line_lower for keyword in keywords):
-            # Get context (5 lines before and after)
-            start = max(0, i - 5)
-            end = min(len(lines), i + 6)
-            context = '\n'.join(lines[start:end])
-            matches.append(context)
-            if len(matches) >= 3:  # Limit to 3 matches
+        if any(k in line.lower() for k in keywords):
+            start = max(0, i - 2)
+            end = min(len(lines), i + 3)
+            matches.append('\n'.join(lines[start:end]))
+            if len(matches) >= 2:
                 break
 
     if matches:
-        answer = "Based on the devlog, here are relevant sections:\n\n" + "\n\n---\n\n".join(matches[:2])
+        return "Based on the devlog:\n\n" + "\n\n".join(matches[:2])
     else:
-        answer = "I couldn't find specific information about that in the devlog. The devlog may not have entries related to your question yet."
-
-    print(f"✅ Local query complete")
-    return answer
-
-
-def local_generate_handoff(devlog_content: str) -> str:
-    """
-    Local fallback: return last 500 chars as handoff.
-    """
-    print(f"📝 Local handoff (no Gemini)")
-
-    lines = devlog_content.split('\n')
-
-    # Extract key sections
-    recent_changes = []
-    for i, line in enumerate(lines):
-        if '## Recent Changes' in line:
-            # Get next 20 lines
-            recent_changes = lines[i:i+20]
-            break
-
-    handoff = f"""# Handoff Document
-Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-
-## Recent Activity
-{"".join(recent_changes) if recent_changes else "No recent changes recorded yet."}
-
-## Full DevLog
-For complete context, review devlog/project.md
-
----
-*Note: This is a local fallback. Enable Gemini for AI-powered handoffs.*
-"""
-
-    print(f"✅ Local handoff complete")
-    return handoff
+        return "I couldn't find specific information about that in the devlog."
 
 
 # ============================================================================
-# Main Functions (with Gemini + Fallback)
+# Handoff Generation for /handoff endpoint
+# ============================================================================
+
+def generate_handoff(devlog_content: str) -> str:
+    """
+    Generate an intelligent project handoff document.
+    Returns clean, concise markdown - NOT raw log dumps.
+
+    Args:
+        devlog_content: Full devlog content
+
+    Returns:
+        Formatted markdown handoff document
+    """
+    if not GEMINI_AVAILABLE:
+        return _fallback_handoff(devlog_content)
+
+    prompt = f"""You are DevLog AI, generating a CONCISE project handoff document.
+
+RULES:
+- Be SPECIFIC: mention actual components, files, features built
+- Keep it CONCISE: 3-5 bullet points per section
+- NO dumping raw logs or repeating full devlog
+- Focus on ACTIONABLE information for next developer
+
+Structure:
+## What Was Built
+- Specific features/components added (mention files/functions)
+
+## Current System State
+- What's working, what's integrated
+
+## Recent Changes (Last 3-5)
+- Specific changes with filenames
+
+## Open Todos
+- Actionable next steps
+
+## Risks / Warnings
+- Any danger zones or issues to watch
+
+Project Context:
+{devlog_content[:6000]}
+
+Generate clean markdown handoff:"""
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(ask_gemini, prompt)
+            handoff = future.result(timeout=GEMINI_TIMEOUT)
+
+        # Add header with timestamp
+        header = f"""# DevLog Handoff
+Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+---
+
+"""
+        print(f"✅ Gemini generated handoff")
+        return header + handoff.strip()
+
+    except Exception as e:
+        print(f"⚠️  Handoff generation failed: {e}")
+        return _fallback_handoff(devlog_content)
+
+
+def _fallback_handoff(devlog_content: str) -> str:
+    """
+    Fallback handoff generation when Gemini is unavailable.
+    """
+    lines = devlog_content.split('\n')
+    recent = '\n'.join(lines[-30:]) if len(lines) > 30 else devlog_content
+
+    return f"""# DevLog Handoff
+Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+## Status
+⚠️  Gemini unavailable - using basic summary
+
+## Recent Activity
+{recent}
+
+## Next Steps
+- Review full devlog at devlog/project.md
+- Verify system integrations
+- Run tests
+
+---
+*For detailed context, review the complete devlog file*
+"""
+
+
+# ============================================================================
+# Legacy function for backward compatibility
 # ============================================================================
 
 def process_change(filepath: str, diff: str, current_devlog: str) -> str:
     """
-    Process a file change using Gemini to update the devlog intelligently.
-    Falls back to local processing if Gemini is unavailable.
-
-    Args:
-        filepath: Path to the changed file
-        diff: The diff of the change
-        current_devlog: Current devlog markdown content
-
-    Returns:
-        Updated devlog markdown content
+    Legacy function - returns enriched devlog.
+    For new code, use analyze_change_with_gemini() instead.
     """
-    # Use local fallback if Gemini not available
-    if not GEMINI_AVAILABLE:
-        return local_process_change(filepath, diff, current_devlog)
+    # This is kept for backward compatibility but not used in main flow
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    def call_gemini():
-        """Internal function to call Gemini (for timeout wrapper)"""
-        prompt = f"""You are DevLog AI, maintaining a living development log for Innovation Hacks 2026.
+    analysis = analyze_change_with_gemini(filepath, "", diff)
 
-A file changed:
-**File:** {filepath}
-**Diff:**
-```diff
-{diff}
-```
+    entry = f"""
+**{timestamp}** — {analysis['classification'].upper()}: `{filepath}`
+{analysis['summary']}
+{f"⚠️  DANGER: {analysis['reason']}" if analysis['danger'] else ""}
 
-**Current DevLog:**
-```markdown
-{current_devlog}
-```
-
-**Your task:**
-
-1. **Classify the change:**
-   - Type: feature / fix / breaking / revert / config / refactor
-
-2. **Write a summary:**
-   - 2-3 sentences in plain English
-   - What changed and why it matters
-   - Potential impact on the project
-
-3. **Detect danger zones:**
-   - Does this touch auth, database schemas, API contracts, or security code?
-   - If yes, add to "Danger Zones" section
-
-4. **Update "What Needs To Be Built":**
-   - Based on this change, what's next?
-   - What dependencies or related work does this create?
-   - Check off completed items if relevant
-
-5. **Update "Current Working State":**
-   - What's the project state after this change?
-   - Update Backend/Frontend/Extension status
-
-**Return the COMPLETE updated DevLog markdown** with:
-- New entry under "Recent Changes"
-- Updated "What Needs To Be Built"
-- Updated "Current Working State"
-- Updated "Danger Zones" if needed
-- All existing content preserved
-
-Format as clean markdown ready to write directly to the file.
 """
 
-        return ask_gemini(prompt)
-
-    try:
-        # Execute with timeout
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(call_gemini)
-            updated_devlog = future.result(timeout=GEMINI_TIMEOUT)
-
-        print(f"✅ Gemini processed change: {filepath}")
-        return updated_devlog
-
-    except FuturesTimeoutError:
-        print(f"⏱️  Gemini timeout after {GEMINI_TIMEOUT}s - using local fallback")
-        return local_process_change(filepath, diff, current_devlog)
-
-    except Exception as e:
-        print(f"❌ Gemini processing failed: {e} - using local fallback")
-        return local_process_change(filepath, diff, current_devlog)
-
-
-def answer_query(question: str, devlog_content: str) -> str:
-    """
-    Answer a question about the project using the devlog as context.
-    Falls back to keyword search if Gemini is unavailable.
-
-    Args:
-        question: User's question
-        devlog_content: Full devlog markdown content
-
-    Returns:
-        Plain English answer
-    """
-    # Use local fallback if Gemini not available
-    if not GEMINI_AVAILABLE:
-        return local_answer_query(question, devlog_content)
-
-    def call_gemini():
-        """Internal function to call Gemini (for timeout wrapper)"""
-        prompt = f"""You are DevLog AI, an assistant for Innovation Hacks 2026.
-
-**DevLog:**
-```markdown
-{devlog_content}
-```
-
-**User Question:**
-{question}
-
-**Instructions:**
-1. Answer based ONLY on the devlog content
-2. If info isn't in the devlog, say so clearly
-3. Cite specific entries or timestamps when relevant
-4. Be concise but complete (2-4 sentences)
-5. If the question implies next steps, suggest them
-
-Provide a helpful, accurate answer in plain English.
-"""
-
-        return ask_gemini(prompt)
-
-    try:
-        # Execute with timeout
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(call_gemini)
-            answer = future.result(timeout=GEMINI_TIMEOUT)
-
-        print(f"✅ Gemini answered query: {question[:50]}...")
-        return answer
-
-    except FuturesTimeoutError:
-        print(f"⏱️  Query timeout after {GEMINI_TIMEOUT}s - using local fallback")
-        return local_answer_query(question, devlog_content)
-
-    except Exception as e:
-        print(f"❌ Query failed: {e} - using local fallback")
-        return local_answer_query(question, devlog_content)
-
-
-def generate_handoff(devlog_content: str) -> str:
-    """
-    Generate a session handoff document from the devlog.
-    Falls back to simple summary if Gemini is unavailable.
-
-    Args:
-        devlog_content: Full devlog markdown content
-
-    Returns:
-        Handoff document as markdown
-    """
-    # Use local fallback if Gemini not available
-    if not GEMINI_AVAILABLE:
-        return local_generate_handoff(devlog_content)
-
-    def call_gemini():
-        """Internal function to call Gemini (for timeout wrapper)"""
-        prompt = f"""You are DevLog AI. Generate a session handoff brief for Innovation Hacks 2026.
-
-**DevLog:**
-```markdown
-{devlog_content}
-```
-
-**Create a handoff document with:**
-
-1. **What Was Done** (3-4 bullet points)
-   - Key accomplishments this session
-   - Files modified
-
-2. **Current State**
-   - What's working
-   - What's in progress
-   - What's blocked
-
-3. **Next Steps** (prioritized)
-   - Most important tasks to tackle next
-   - Dependencies to resolve
-
-4. **Danger Zones**
-   - Known issues or risky areas
-   - Technical debt
-
-5. **How to Continue**
-   - Commands to run
-   - Files to check
-   - Context needed
-
-Format as clean, scannable markdown. Keep it under 300 words.
-"""
-
-        return ask_gemini(prompt)
-
-    try:
-        # Execute with timeout
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(call_gemini)
-            handoff_doc = future.result(timeout=GEMINI_TIMEOUT)
-
-        print(f"✅ Gemini generated handoff ({len(handoff_doc)} chars)")
-        return handoff_doc
-
-    except FuturesTimeoutError:
-        print(f"⏱️  Handoff timeout after {GEMINI_TIMEOUT}s - using local fallback")
-        return local_generate_handoff(devlog_content)
-
-    except Exception as e:
-        print(f"❌ Handoff generation failed: {e} - using local fallback")
-        return local_generate_handoff(devlog_content)
+    return current_devlog + entry
 
 
 # ============================================================================
@@ -418,7 +517,7 @@ if __name__ == "__main__":
         print("✅ Gemini is available and ready!")
         print(f"📍 Model: {MODEL_NAME}\n")
 
-        # Test simple query
+        # Test query
         try:
             test_answer = answer_query(
                 "What is this project about?",
@@ -431,16 +530,7 @@ if __name__ == "__main__":
     else:
         print("❌ Gemini is NOT available")
         print("📝 Using local fallback mode\n")
-
-        # Test local fallback
-        test_devlog = "# DevLog AI\n\n## Recent Changes\nNone yet"
-        test_diff = "+print('hello world')\n+def main():\n+    pass"
-
-        result = local_process_change("test.py", test_diff, test_devlog)
-        print("Local processing test:")
-        print(result[:200])
-
-        print("\n\nTo enable Gemini:")
+        print("To enable Gemini:")
         print("1. Install: pip install google-genai")
         print("2. Authenticate: gcloud auth application-default login")
         print("3. Restart the API server")
