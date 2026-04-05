@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "devlog": {
+      "type": "http", 
+      "url": "http://localhost:8000",
+      "tools": [
+        "log_decision",
+        "get_project_context",
+        "flag_danger_zone"
+      ]
+    }
+  }
+}

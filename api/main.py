@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -141,6 +141,35 @@ def format_change_entry(change: ChangeEvent) -> str:
     return entry
 
 
+def enrich_with_gemini(filepath: str, diff: str):
+    """
+    Background task to enrich the devlog with Gemini analysis.
+    Reads the current devlog, processes with Gemini, and overwrites with enriched version.
+    """
+    try:
+        print(f"🤖 Background: Processing {filepath} with Gemini...")
+
+        # Read current devlog
+        current_devlog = read_devlog()
+
+        # Use Gemini to process and enrich
+        enriched_devlog = process_change(
+            filepath=filepath,
+            diff=diff,
+            current_devlog=current_devlog
+        )
+
+        # Only overwrite if Gemini actually enriched it (not just returned original)
+        if enriched_devlog != current_devlog:
+            DEVLOG_PATH.write_text(enriched_devlog, encoding='utf-8')
+            print(f"✅ Background: Gemini enriched {filepath}")
+        else:
+            print(f"⚠️  Background: Gemini returned unchanged (may have failed)")
+
+    except Exception as e:
+        print(f"❌ Background: Gemini enrichment failed for {filepath}: {e}")
+
+
 # ============================================================================
 # API Endpoints
 # ============================================================================
@@ -165,53 +194,41 @@ async def root():
 
 
 @app.post("/change", response_model=StatusResponse)
-async def receive_change(change: ChangeEvent):
+async def receive_change(change: ChangeEvent, background_tasks: BackgroundTasks):
     """
     Receive a file change event from the watcher.
-    Uses Gemini to intelligently process and update the devlog.
+    Immediately writes raw diff, then enriches with Gemini in background.
     """
     try:
         print(f"📝 POST /change - {change.file_path} ({change.event_type})")
 
-        # Read current devlog
-        current_devlog = read_devlog()
-
-        # Use Gemini to process the change and update devlog
-        updated_devlog = process_change(
-            filepath=change.file_path,
-            diff=change.diff,
-            current_devlog=current_devlog
-        )
-
-        # Write the updated devlog
-        DEVLOG_PATH.write_text(updated_devlog, encoding='utf-8')
+        # STEP 1: Write raw diff immediately (never block)
+        entry = format_change_entry(change)
+        append_to_devlog(entry)
 
         timestamp = datetime.now().isoformat()
 
-        print(f"✅ Logged change with Gemini: {change.file_path}")
+        print(f"✅ Logged raw change: {change.file_path}")
 
+        # STEP 2: Schedule Gemini enrichment as background task
+        background_tasks.add_task(
+            enrich_with_gemini,
+            filepath=change.file_path,
+            diff=change.diff
+        )
+
+        print(f"🔄 Scheduled Gemini enrichment for: {change.file_path}")
+
+        # STEP 3: Return immediately (watcher never times out)
         return StatusResponse(
             status="success",
-            message=f"Change processed: {change.file_path}",
+            message=f"Change logged: {change.file_path}",
             timestamp=timestamp
         )
 
     except Exception as e:
         print(f"❌ Error logging change: {e}")
-
-        # Fallback: append simple entry if Gemini processing fails completely
-        try:
-            entry = format_change_entry(change)
-            append_to_devlog(entry)
-            print(f"⚠️  Fallback: appended simple entry")
-
-            return StatusResponse(
-                status="success",
-                message=f"Change logged (fallback): {change.file_path}",
-                timestamp=datetime.now().isoformat()
-            )
-        except Exception as fallback_error:
-            raise HTTPException(status_code=500, detail=f"Failed to log change: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to log change: {str(e)}")
 
 
 @app.get("/devlog", response_model=DevlogResponse)

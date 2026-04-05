@@ -1,41 +1,184 @@
 """
 DevLog AI - Gemini Agent
 Uses Gemini 1.5 Pro via Vertex AI to process changes and generate insights.
+Falls back to local summarization when GCP is not configured.
 """
 
 import os
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import Optional
-from dotenv import load_dotenv
-
-import vertexai
-from vertexai.generative_models import GenerativeModel, GenerationConfig
+from datetime import datetime
 
 
-# Load environment variables from .env
-load_dotenv()
-
-# Environment variables
-GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
-GCP_LOCATION = os.getenv("GCP_LOCATION", "us-central1")
-
-# Initialize Vertex AI
+# Try to import Google Cloud dependencies
 GEMINI_AVAILABLE = False
 try:
-    if not GCP_PROJECT_ID:
-        print("⚠️  GCP_PROJECT_ID not set in .env - Gemini features disabled")
-    else:
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    import vertexai
+    from vertexai.generative_models import GenerativeModel, GenerationConfig
+
+    # Environment variables
+    GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
+    GCP_LOCATION = os.getenv("GCP_LOCATION", "us-central1")
+
+    # Initialize Vertex AI
+    if GCP_PROJECT_ID:
         vertexai.init(project=GCP_PROJECT_ID, location=GCP_LOCATION)
         MODEL_NAME = "gemini-1.5-pro"
         GEMINI_AVAILABLE = True
         print(f"✅ Vertex AI initialized: {GCP_PROJECT_ID} / {GCP_LOCATION}")
+    else:
+        print("⚠️  GCP_PROJECT_ID not set - Gemini features disabled")
+
+except ImportError as e:
+    print(f"⚠️  Google Cloud packages not installed - Gemini features disabled")
+    print(f"   To enable: pip install google-cloud-aiplatform python-dotenv")
+    GCP_PROJECT_ID = None
+    GCP_LOCATION = None
+    MODEL_NAME = None
+
 except Exception as e:
     print(f"⚠️  Failed to initialize Vertex AI: {e}")
-    print("📝 Gemini features disabled. Set GCP_PROJECT_ID in .env")
+    print("📝 Gemini features disabled")
+    GCP_PROJECT_ID = None
+    GCP_LOCATION = None
+    MODEL_NAME = None
 
+
+# Constants
+GEMINI_TIMEOUT = 30  # seconds
+
+
+# ============================================================================
+# Local Fallback Functions
+# ============================================================================
+
+def local_process_change(filepath: str, diff: str, current_devlog: str) -> str:
+    """
+    Local fallback: smart summarization without Gemini.
+    Detects change type and appends to devlog.
+    """
+    print(f"📝 Local processing (no Gemini): {filepath}")
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Analyze diff to determine change type
+    lines = diff.split('\n')
+    added_lines = [l for l in lines if l.startswith('+') and not l.startswith('+++')]
+    removed_lines = [l for l in lines if l.startswith('-') and not l.startswith('---')]
+
+    added_count = len(added_lines)
+    removed_count = len(removed_lines)
+
+    # Classify change
+    if removed_count == 0 and added_count > 0:
+        change_type = "feature"
+        summary = f"Added {added_count} new lines to {filepath}"
+    elif added_count == 0 and removed_count > 0:
+        change_type = "cleanup/removal"
+        summary = f"Removed {removed_count} lines from {filepath}"
+    elif removed_count > added_count:
+        change_type = "refactor/fix"
+        summary = f"Refactored {filepath} (removed {removed_count}, added {added_count} lines)"
+    else:
+        change_type = "modification"
+        summary = f"Modified {filepath} (added {added_count}, removed {removed_count} lines)"
+
+    # Detect potential danger zones
+    danger_keywords = ['auth', 'password', 'token', 'security', 'database', 'schema', 'migration', 'api']
+    is_danger = any(keyword in filepath.lower() or keyword in diff.lower() for keyword in danger_keywords)
+    danger_note = "\n⚠️  **Potential danger zone detected**" if is_danger else ""
+
+    # Build entry
+    entry = f"""
+**{timestamp}** — {change_type.upper()}: `{filepath}`
+{summary}{danger_note}
+
+"""
+
+    # Append to current devlog
+    updated_devlog = current_devlog + entry
+
+    print(f"✅ Local processing complete: {filepath}")
+    return updated_devlog
+
+
+def local_answer_query(question: str, devlog_content: str) -> str:
+    """
+    Local fallback: keyword search in devlog.
+    """
+    print(f"📝 Local query (no Gemini): {question[:50]}...")
+
+    # Simple keyword extraction
+    keywords = [word.lower().strip('?.,!') for word in question.split() if len(word) > 3]
+
+    # Search for matching sections
+    lines = devlog_content.split('\n')
+    matches = []
+
+    for i, line in enumerate(lines):
+        line_lower = line.lower()
+        if any(keyword in line_lower for keyword in keywords):
+            # Get context (5 lines before and after)
+            start = max(0, i - 5)
+            end = min(len(lines), i + 6)
+            context = '\n'.join(lines[start:end])
+            matches.append(context)
+            if len(matches) >= 3:  # Limit to 3 matches
+                break
+
+    if matches:
+        answer = "Based on the devlog, here are relevant sections:\n\n" + "\n\n---\n\n".join(matches[:2])
+    else:
+        answer = "I couldn't find specific information about that in the devlog. The devlog may not have entries related to your question yet."
+
+    print(f"✅ Local query complete")
+    return answer
+
+
+def local_generate_handoff(devlog_content: str) -> str:
+    """
+    Local fallback: return last 500 chars as handoff.
+    """
+    print(f"📝 Local handoff (no Gemini)")
+
+    lines = devlog_content.split('\n')
+
+    # Extract key sections
+    recent_changes = []
+    for i, line in enumerate(lines):
+        if '## Recent Changes' in line:
+            # Get next 20 lines
+            recent_changes = lines[i:i+20]
+            break
+
+    handoff = f"""# Handoff Document
+Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+## Recent Activity
+{"".join(recent_changes) if recent_changes else "No recent changes recorded yet."}
+
+## Full DevLog
+For complete context, review devlog/project.md
+
+---
+*Note: This is a local fallback. Enable Gemini for AI-powered handoffs.*
+"""
+
+    print(f"✅ Local handoff complete")
+    return handoff
+
+
+# ============================================================================
+# Main Functions (with Gemini + Fallback)
+# ============================================================================
 
 def process_change(filepath: str, diff: str, current_devlog: str) -> str:
     """
     Process a file change using Gemini to update the devlog intelligently.
+    Falls back to local processing if Gemini is unavailable.
 
     Args:
         filepath: Path to the changed file
@@ -43,14 +186,14 @@ def process_change(filepath: str, diff: str, current_devlog: str) -> str:
         current_devlog: Current devlog markdown content
 
     Returns:
-        Updated devlog markdown content (or original if Gemini fails)
+        Updated devlog markdown content
     """
+    # Use local fallback if Gemini not available
     if not GEMINI_AVAILABLE:
-        print("⚠️  Gemini unavailable - returning original devlog")
-        return current_devlog
+        return local_process_change(filepath, diff, current_devlog)
 
-    try:
-        # Create the prompt
+    def call_gemini():
+        """Internal function to call Gemini (for timeout wrapper)"""
         prompt = f"""You are DevLog AI, maintaining a living development log for Innovation Hacks 2026.
 
 A file changed:
@@ -110,21 +253,30 @@ Format as clean markdown ready to write directly to the file.
             generation_config=config
         )
 
-        # Extract text from response
-        updated_devlog = response.text.strip()
+        return response.text.strip()
+
+    try:
+        # Execute with timeout
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(call_gemini)
+            updated_devlog = future.result(timeout=GEMINI_TIMEOUT)
 
         print(f"✅ Gemini processed change: {filepath}")
         return updated_devlog
 
+    except FuturesTimeoutError:
+        print(f"⏱️  Gemini timeout after {GEMINI_TIMEOUT}s - using local fallback")
+        return local_process_change(filepath, diff, current_devlog)
+
     except Exception as e:
-        print(f"❌ Gemini processing failed: {e}")
-        print("📝 Returning original devlog unchanged")
-        return current_devlog
+        print(f"❌ Gemini processing failed: {e} - using local fallback")
+        return local_process_change(filepath, diff, current_devlog)
 
 
 def answer_query(question: str, devlog_content: str) -> str:
     """
     Answer a question about the project using the devlog as context.
+    Falls back to keyword search if Gemini is unavailable.
 
     Args:
         question: User's question
@@ -133,10 +285,12 @@ def answer_query(question: str, devlog_content: str) -> str:
     Returns:
         Plain English answer
     """
+    # Use local fallback if Gemini not available
     if not GEMINI_AVAILABLE:
-        return "Gemini is not available. Set GCP_PROJECT_ID in .env to enable AI-powered queries."
+        return local_answer_query(question, devlog_content)
 
-    try:
+    def call_gemini():
+        """Internal function to call Gemini (for timeout wrapper)"""
         prompt = f"""You are DevLog AI, an assistant for Innovation Hacks 2026.
 
 **DevLog:**
@@ -168,19 +322,30 @@ Provide a helpful, accurate answer in plain English.
             generation_config=config
         )
 
-        answer = response.text.strip()
+        return response.text.strip()
+
+    try:
+        # Execute with timeout
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(call_gemini)
+            answer = future.result(timeout=GEMINI_TIMEOUT)
 
         print(f"✅ Gemini answered query: {question[:50]}...")
         return answer
 
+    except FuturesTimeoutError:
+        print(f"⏱️  Query timeout after {GEMINI_TIMEOUT}s - using local fallback")
+        return local_answer_query(question, devlog_content)
+
     except Exception as e:
-        print(f"❌ Query failed: {e}")
-        return f"Error answering question: {str(e)}\n\nCheck your GCP credentials and Vertex AI setup."
+        print(f"❌ Query failed: {e} - using local fallback")
+        return local_answer_query(question, devlog_content)
 
 
 def generate_handoff(devlog_content: str) -> str:
     """
     Generate a session handoff document from the devlog.
+    Falls back to simple summary if Gemini is unavailable.
 
     Args:
         devlog_content: Full devlog markdown content
@@ -188,10 +353,12 @@ def generate_handoff(devlog_content: str) -> str:
     Returns:
         Handoff document as markdown
     """
+    # Use local fallback if Gemini not available
     if not GEMINI_AVAILABLE:
-        return "# Handoff Document\n\nGemini is not available. Set GCP_PROJECT_ID in .env to generate AI-powered handoffs."
+        return local_generate_handoff(devlog_content)
 
-    try:
+    def call_gemini():
+        """Internal function to call Gemini (for timeout wrapper)"""
         prompt = f"""You are DevLog AI. Generate a session handoff brief for Innovation Hacks 2026.
 
 **DevLog:**
@@ -237,24 +404,24 @@ Format as clean, scannable markdown. Keep it under 300 words.
             generation_config=config
         )
 
-        handoff_doc = response.text.strip()
+        return response.text.strip()
+
+    try:
+        # Execute with timeout
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(call_gemini)
+            handoff_doc = future.result(timeout=GEMINI_TIMEOUT)
 
         print(f"✅ Gemini generated handoff ({len(handoff_doc)} chars)")
         return handoff_doc
 
+    except FuturesTimeoutError:
+        print(f"⏱️  Handoff timeout after {GEMINI_TIMEOUT}s - using local fallback")
+        return local_generate_handoff(devlog_content)
+
     except Exception as e:
-        print(f"❌ Handoff generation failed: {e}")
-        return f"""# Handoff Document
-
-**Error:** Could not generate handoff using Gemini.
-
-**Error Details:** {str(e)}
-
-Please check your GCP credentials and Vertex AI API access.
-
-**Manual Handoff:**
-Review devlog/project.md for complete project history.
-"""
+        print(f"❌ Handoff generation failed: {e} - using local fallback")
+        return local_generate_handoff(devlog_content)
 
 
 # ============================================================================
@@ -268,7 +435,7 @@ if __name__ == "__main__":
         print("✅ Gemini is available and ready!")
         print(f"📍 Project: {GCP_PROJECT_ID}")
         print(f"📍 Location: {GCP_LOCATION}")
-        print(f"📍 Model: gemini-1.5-pro\n")
+        print(f"📍 Model: {MODEL_NAME}\n")
 
         # Test simple query
         test_answer = answer_query(
@@ -279,9 +446,18 @@ if __name__ == "__main__":
 
     else:
         print("❌ Gemini is NOT available")
-        print("\nTo enable Gemini:")
-        print("1. Create .env file in project root")
-        print("2. Add: GCP_PROJECT_ID=your-project-id")
-        print("3. Add: GCP_LOCATION=us-central1")
-        print("4. Run: gcloud auth application-default login")
-        print("5. Restart the API server")
+        print("📝 Using local fallback mode\n")
+
+        # Test local fallback
+        test_devlog = "# DevLog AI\n\n## Recent Changes\nNone yet"
+        test_diff = "+print('hello world')\n+def main():\n+    pass"
+
+        result = local_process_change("test.py", test_diff, test_devlog)
+        print("Local processing test:")
+        print(result[:200])
+
+        print("\n\nTo enable Gemini:")
+        print("1. Install: pip install google-cloud-aiplatform python-dotenv")
+        print("2. Create .env file with: GCP_PROJECT_ID=your-project-id")
+        print("3. Run: gcloud auth application-default login")
+        print("4. Restart the API server")
