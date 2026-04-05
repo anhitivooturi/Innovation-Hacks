@@ -6,7 +6,7 @@ class SidebarProvider {
   constructor(extensionUri, statusProvider, output) {
     this._view = null
     this._output = output
-    this._apiUrl = 'https://devlog-backend-130030203761.us-central1.run.app'
+    this._apiUrl = 'https://devlog-backend-980285509584.us-central1.run.app'
     this._data = {
       health: 'unknown',
       recentChanges: [],
