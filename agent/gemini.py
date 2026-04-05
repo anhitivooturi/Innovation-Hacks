@@ -1,6 +1,6 @@
 """
 DevLog AI - Gemini Agent
-Uses Gemini 1.5 Pro via Vertex AI to process changes and generate insights.
+Uses Gemini 2.5 Flash via Vertex AI with google.genai SDK.
 Falls back to local summarization when GCP is not configured.
 """
 
@@ -10,45 +10,62 @@ from typing import Optional
 from datetime import datetime
 
 
-# Try to import Google Cloud dependencies
+# Try to import Google GenAI SDK
 GEMINI_AVAILABLE = False
+genai_client = None
+
 try:
-    from dotenv import load_dotenv
-    load_dotenv()
+    import google.genai as genai
 
-    import vertexai
-    from vertexai.generative_models import GenerativeModel, GenerationConfig
+    # Initialize Vertex AI client (NO API keys)
+    genai_client = genai.Client(
+        vertexai=True,
+        project="devlog-vibhor-gemini",
+        location="us-central1"
+    )
 
-    # Environment variables
-    GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
-    GCP_LOCATION = os.getenv("GCP_LOCATION", "us-central1")
-
-    # Initialize Vertex AI
-    if GCP_PROJECT_ID:
-        vertexai.init(project=GCP_PROJECT_ID, location=GCP_LOCATION)
-        MODEL_NAME = "gemini-1.5-pro"
-        GEMINI_AVAILABLE = True
-        print(f"✅ Vertex AI initialized: {GCP_PROJECT_ID} / {GCP_LOCATION}")
-    else:
-        print("⚠️  GCP_PROJECT_ID not set - Gemini features disabled")
+    GEMINI_AVAILABLE = True
+    print("✅ Gemini 2.5 Flash initialized via Vertex AI")
+    print("📍 Project: devlog-vibhor-gemini")
+    print("📍 Location: us-central1")
 
 except ImportError as e:
-    print(f"⚠️  Google Cloud packages not installed - Gemini features disabled")
-    print(f"   To enable: pip install google-cloud-aiplatform python-dotenv")
-    GCP_PROJECT_ID = None
-    GCP_LOCATION = None
-    MODEL_NAME = None
+    print("⚠️  google-genai package not installed - Gemini features disabled")
+    print("   To enable: pip install google-genai")
 
 except Exception as e:
-    print(f"⚠️  Failed to initialize Vertex AI: {e}")
+    print(f"⚠️  Failed to initialize Gemini: {e}")
     print("📝 Gemini features disabled")
-    GCP_PROJECT_ID = None
-    GCP_LOCATION = None
-    MODEL_NAME = None
 
 
 # Constants
 GEMINI_TIMEOUT = 30  # seconds
+MODEL_NAME = "gemini-2.5-flash"
+
+
+# ============================================================================
+# Core Gemini Function
+# ============================================================================
+
+def ask_gemini(prompt: str) -> str:
+    """
+    Send a prompt to Gemini and get a response.
+
+    Args:
+        prompt: The prompt to send
+
+    Returns:
+        Gemini's response text
+    """
+    if not GEMINI_AVAILABLE:
+        raise Exception("Gemini is not available")
+
+    response = genai_client.models.generate_content(
+        model=MODEL_NAME,
+        contents=prompt
+    )
+
+    return response.text
 
 
 # ============================================================================
@@ -241,19 +258,7 @@ A file changed:
 Format as clean markdown ready to write directly to the file.
 """
 
-        # Call Gemini
-        model = GenerativeModel(MODEL_NAME)
-        config = GenerationConfig(
-            temperature=0.3,  # Lower temperature for consistency
-            max_output_tokens=8192,
-        )
-
-        response = model.generate_content(
-            prompt,
-            generation_config=config
-        )
-
-        return response.text.strip()
+        return ask_gemini(prompt)
 
     try:
         # Execute with timeout
@@ -311,18 +316,7 @@ def answer_query(question: str, devlog_content: str) -> str:
 Provide a helpful, accurate answer in plain English.
 """
 
-        model = GenerativeModel(MODEL_NAME)
-        config = GenerationConfig(
-            temperature=0.5,
-            max_output_tokens=2048,
-        )
-
-        response = model.generate_content(
-            prompt,
-            generation_config=config
-        )
-
-        return response.text.strip()
+        return ask_gemini(prompt)
 
     try:
         # Execute with timeout
@@ -393,18 +387,7 @@ def generate_handoff(devlog_content: str) -> str:
 Format as clean, scannable markdown. Keep it under 300 words.
 """
 
-        model = GenerativeModel(MODEL_NAME)
-        config = GenerationConfig(
-            temperature=0.4,
-            max_output_tokens=4096,
-        )
-
-        response = model.generate_content(
-            prompt,
-            generation_config=config
-        )
-
-        return response.text.strip()
+        return ask_gemini(prompt)
 
     try:
         # Execute with timeout
@@ -433,16 +416,17 @@ if __name__ == "__main__":
 
     if GEMINI_AVAILABLE:
         print("✅ Gemini is available and ready!")
-        print(f"📍 Project: {GCP_PROJECT_ID}")
-        print(f"📍 Location: {GCP_LOCATION}")
         print(f"📍 Model: {MODEL_NAME}\n")
 
         # Test simple query
-        test_answer = answer_query(
-            "What is this project about?",
-            "# DevLog AI — Innovation Hacks 2026\nBuilding an AI agent that watches code changes."
-        )
-        print(f"Test Query Response:\n{test_answer}\n")
+        try:
+            test_answer = answer_query(
+                "What is this project about?",
+                "# DevLog AI — Innovation Hacks 2026\nBuilding an AI agent that watches code changes."
+            )
+            print(f"Test Query Response:\n{test_answer}\n")
+        except Exception as e:
+            print(f"Test failed: {e}")
 
     else:
         print("❌ Gemini is NOT available")
@@ -457,7 +441,6 @@ if __name__ == "__main__":
         print(result[:200])
 
         print("\n\nTo enable Gemini:")
-        print("1. Install: pip install google-cloud-aiplatform python-dotenv")
-        print("2. Create .env file with: GCP_PROJECT_ID=your-project-id")
-        print("3. Run: gcloud auth application-default login")
-        print("4. Restart the API server")
+        print("1. Install: pip install google-genai")
+        print("2. Authenticate: gcloud auth application-default login")
+        print("3. Restart the API server")
