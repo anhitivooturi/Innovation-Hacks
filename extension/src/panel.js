@@ -125,6 +125,12 @@ function buildHomeHtml() {
     .query-input::placeholder{color:var(--vscode-input-placeholderForeground)}
     .answer-box{margin-top:12px;padding:12px;background:var(--vscode-textBlockQuote-background);border-left:3px solid var(--vscode-button-background);border-radius:4px;font-size:13px;line-height:1.6;white-space:pre-wrap;display:none}
     .tag{display:inline-block;font-size:10px;padding:2px 7px;border-radius:10px;background:var(--vscode-badge-background);color:var(--vscode-badge-foreground);margin-left:8px}
+    .tts-bar{display:none;align-items:center;gap:8px;margin-top:14px;padding:10px 14px;background:var(--vscode-textBlockQuote-background);border-radius:8px;border:1px solid var(--vscode-panel-border)}
+    .tts-bar.visible{display:flex}
+    .tts-btn{background:var(--vscode-button-background);color:var(--vscode-button-foreground);border:none;border-radius:6px;padding:5px 12px;cursor:pointer;font-size:12px;display:flex;align-items:center;gap:5px}
+    .tts-btn.stop{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)}
+    .tts-label{font-size:11px;color:var(--vscode-descriptionForeground);flex:1}
+    .tts-speed{background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border);border-radius:4px;padding:3px 6px;font-size:11px;width:70px}
   </style>
 </head>
 <body>
@@ -191,6 +197,18 @@ function buildHomeHtml() {
       <button class="back-btn" id="back-btn">← Back</button>
     </div>
     <div id="output-body"></div>
+    <!-- TTS bar appears after content loads -->
+    <div class="tts-bar" id="tts-bar">
+      <span class="tts-label">🔊 Read aloud</span>
+      <select class="tts-speed" id="tts-speed" title="Speed">
+        <option value="0.75">0.75×</option>
+        <option value="1" selected>1×</option>
+        <option value="1.25">1.25×</option>
+        <option value="1.5">1.5×</option>
+      </select>
+      <button class="tts-btn" id="tts-play">▶ Play</button>
+      <button class="tts-btn stop" id="tts-stop" style="display:none">■ Stop</button>
+    </div>
   </div>
 
   <script nonce="${nonce}" src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
@@ -223,11 +241,7 @@ function buildHomeHtml() {
       vscode.postMessage({ type: 'query', text })
     }
 
-    // Back button
-    document.getElementById('back-btn').addEventListener('click', () => {
-      document.getElementById('home').style.display = 'grid'
-      document.getElementById('output').style.display = 'none'
-    })
+    // Back button — handled in TTS section above
 
     function showLoading(label) {
       document.getElementById('home').style.display = 'none'
@@ -247,6 +261,21 @@ function buildHomeHtml() {
         const box = document.getElementById('answer-box')
         box.style.display = 'block'
         box.textContent = msg.answer
+        // TTS for answer — show a small read button inline
+        const existing = document.getElementById('answer-tts')
+        if (existing) existing.remove()
+        const btn = document.createElement('button')
+        btn.id = 'answer-tts'
+        btn.className = 'tts-btn'
+        btn.style.cssText = 'margin-top:8px;font-size:11px'
+        btn.textContent = '🔊 Read answer'
+        btn.addEventListener('click', () => {
+          speechSynthesis.cancel()
+          const utt = new SpeechSynthesisUtterance(msg.answer)
+          utt.rate = 1
+          speechSynthesis.speak(utt)
+        })
+        box.after(btn)
       } else if (msg.type === 'result') {
         renderResult(msg.label, msg.data)
       }
@@ -255,6 +284,7 @@ function buildHomeHtml() {
     async function renderResult(label, data) {
       document.getElementById('output-title').textContent = label
       const body = document.getElementById('output-body')
+      let speakText = ''
 
       // If there's a mermaid diagram
       if (data.mermaid) {
@@ -272,6 +302,8 @@ function buildHomeHtml() {
         } catch(err) {
           document.getElementById(id).textContent = data.mermaid
         }
+        speakText = [label, data.summary || data.explanation || '', ...(data.bullets || data.body || [])].filter(Boolean).join('. ')
+        setTtsText(speakText)
         return
       }
 
@@ -294,6 +326,12 @@ function buildHomeHtml() {
             vscode.postMessage({ type: 'explainFile', filePath: item.dataset.path })
           })
         })
+        speakText = files.map(f => {
+          const name = f.path || f.filePath || f
+          const desc = f.description || f.summary || ''
+          return desc ? \`\${name}: \${desc}\` : name
+        }).join('. ')
+        setTtsText(speakText)
         return
       }
 
@@ -305,7 +343,47 @@ function buildHomeHtml() {
         \${renderRefs(data.references || [])}
         <pre style="margin-top:12px;font-size:12px;white-space:pre-wrap">\${esc(JSON.stringify(data, null, 2))}</pre>
       \`
+      speakText = [data.title, data.summary || data.explanation, ...(data.bullets || data.body || [])].filter(Boolean).join('. ')
+      setTtsText(speakText)
     }
+
+    // ── Text-to-Speech ────────────────────────────────────────────────
+    let _ttsText = ''
+
+    function setTtsText(text) {
+      _ttsText = text
+      speechSynthesis.cancel()
+      document.getElementById('tts-bar').classList.toggle('visible', !!text.trim())
+      document.getElementById('tts-play').style.display = 'inline-flex'
+      document.getElementById('tts-stop').style.display = 'none'
+    }
+
+    document.getElementById('tts-play').addEventListener('click', () => {
+      if (!_ttsText) return
+      speechSynthesis.cancel()
+      const utt = new SpeechSynthesisUtterance(_ttsText)
+      utt.rate = parseFloat(document.getElementById('tts-speed').value)
+      utt.onend = () => {
+        document.getElementById('tts-play').style.display = 'inline-flex'
+        document.getElementById('tts-stop').style.display = 'none'
+      }
+      speechSynthesis.speak(utt)
+      document.getElementById('tts-play').style.display = 'none'
+      document.getElementById('tts-stop').style.display = 'inline-flex'
+    })
+
+    document.getElementById('tts-stop').addEventListener('click', () => {
+      speechSynthesis.cancel()
+      document.getElementById('tts-play').style.display = 'inline-flex'
+      document.getElementById('tts-stop').style.display = 'none'
+    })
+
+    // Stop speaking when navigating back
+    document.getElementById('back-btn').addEventListener('click', () => {
+      speechSynthesis.cancel()
+      document.getElementById('home').style.display = 'grid'
+      document.getElementById('output').style.display = 'none'
+    })
 
     function renderBullets(items) {
       if (!items.length) return ''
