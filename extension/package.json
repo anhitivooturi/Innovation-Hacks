@@ -27,6 +27,16 @@
           "type": "boolean",
           "default": true,
           "description": "Show the DevLog status bar item."
+        },
+        "devlog.elevenLabsApiKey": {
+          "type": "string",
+          "default": "sk_6fcf66d103c131a4811d7cda00f11cf49311c5f1b85a5136",
+          "description": "ElevenLabs API key for voice TTS. Leave empty to use browser SpeechSynthesis."
+        },
+        "devlog.elevenLabsVoiceId": {
+          "type": "string",
+          "default": "21m00Tcm4TlvDq8ikWAM",
+          "description": "ElevenLabs voice ID. Defaults to Rachel (21m00Tcm4TlvDq8ikWAM)."
         }
       }
     },

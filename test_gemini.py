@@ -2,7 +2,7 @@ import google.genai as genai
 
 client = genai.Client(
     vertexai=True,
-    project="devlog-vibhor-gemini",
+    project="project-5f6bf043-2561-48a7-af4",
     location="us-central1"
 )
 

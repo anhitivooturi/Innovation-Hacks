@@ -28,6 +28,7 @@ class DevLogBrain:
                 location=settings.gcp_location,
             )
             self._model = GenerativeModel(settings.gemini_model)
+            print(f"[DevLogBrain] Vertex AI enabled. Model: {settings.gemini_model}")
 
     def summarize_change(self, state: ProjectState, event: ChangeEvent) -> LogUpdate:
         if self._model is not None:

@@ -32,7 +32,15 @@ function activate(context) {
       vscode.window.registerWebviewViewProvider('devlogSidebar', sidebarProvider),
 
       // Main command — opens the project explorer panel
-      vscode.commands.registerCommand('devlog.openPanel', () => panel.open()),
+      vscode.commands.registerCommand('devlog.openPanel', () => {
+        panel.open()
+        const cfg = vscode.workspace.getConfiguration('devlog')
+        panel._send({
+          type: 'configure',
+          elevenLabsApiKey: cfg.get('elevenLabsApiKey', ''),
+          elevenLabsVoiceId: cfg.get('elevenLabsVoiceId', '21m00Tcm4TlvDq8ikWAM'),
+        })
+      }),
 
       // Diagram shortcuts (open panel then trigger diagram)
       vscode.commands.registerCommand('devlog.showArchitectureMap',   () => { panel.open(); panel._panel?.webview.postMessage({ type: 'loading', label: 'architecture diagram' }); panel._generate('/diagram', { kind: 'architecture', projectId: getProjectId() }, 'architecture diagram') }),

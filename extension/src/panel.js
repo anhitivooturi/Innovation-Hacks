@@ -80,7 +80,7 @@ function buildHomeHtml() {
 <html lang="en">
 <head>
   <meta charset="UTF-8"/>
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}' https://cdn.jsdelivr.net;">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}' https://cdn.jsdelivr.net; connect-src https://api.elevenlabs.io; media-src blob:;">
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
@@ -140,6 +140,8 @@ function buildHomeHtml() {
   </style>
 </head>
 <body>
+
+<audio id="el-audio" style="display:none"></audio>
 
 <!-- HOME -->
 <div id="home">
@@ -223,6 +225,11 @@ function buildHomeHtml() {
 <script nonce="${nonce}">
   const vscode = acquireVsCodeApi()
   mermaid.initialize({ startOnLoad: false, securityLevel: 'loose', theme: 'neutral' })
+
+  // ── ElevenLabs config (populated via configure message from extension host) ──
+  let elevenLabsApiKey  = ''
+  let elevenLabsVoiceId = '21m00Tcm4TlvDq8ikWAM'
+  let elAudioPlaying    = false
 
   // ── Persist state across panel hides ─────────────────────────────
   const saved = vscode.getState() || {}
@@ -377,12 +384,44 @@ function buildHomeHtml() {
     document.getElementById('answer-box').style.display = 'block'
     document.getElementById('answer-box').textContent = '⏳ Thinking…'
     vscode.postMessage({ type: 'query', text })
-    setTimeout(() => { if (voiceOn) listenForWakeWord() }, 500)
+    // Don't restart listening here — wait until audio finishes (see queryResult handler / el.onended)
   }
 
   // ── TTS helpers ───────────────────────────────────────────────────
-  function speak(text, rate) {
+  async function speak(text, rate) {
     if (!text) return
+    if (elevenLabsApiKey) {
+      try {
+        const res = await fetch(
+          `https://api.elevenlabs.io/v1/text-to-speech/${elevenLabsVoiceId}`,
+          {
+            method: 'POST',
+            headers: { 'xi-api-key': elevenLabsApiKey, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text, model_id: 'eleven_monolingual_v1' }),
+          }
+        )
+        if (!res.ok) throw new Error(`ElevenLabs ${res.status}`)
+        const blob = await res.blob()
+        const url  = URL.createObjectURL(blob)
+        const el   = document.getElementById('el-audio')
+        el.src = url
+        elAudioPlaying = true
+        el.onended = () => {
+          elAudioPlaying = false
+          URL.revokeObjectURL(url)
+          document.getElementById('tts-play').style.display = 'inline-block'
+          document.getElementById('tts-stop').style.display = 'none'
+          if (voiceOn) listenForWakeWord()
+        }
+        el.play()
+        document.getElementById('tts-play').style.display = 'none'
+        document.getElementById('tts-stop').style.display = 'inline-block'
+        return
+      } catch (err) {
+        console.warn('ElevenLabs TTS failed, falling back:', err.message)
+      }
+    }
+    // SpeechSynthesis fallback
     speechSynthesis.cancel()
     const utt = new SpeechSynthesisUtterance(text)
     utt.rate = rate || parseFloat(document.getElementById('tts-speed').value)
@@ -407,6 +446,9 @@ function buildHomeHtml() {
   document.getElementById('tts-play').addEventListener('click', () => speak(_ttsText))
   document.getElementById('tts-stop').addEventListener('click', () => {
     speechSynthesis.cancel()
+    const el = document.getElementById('el-audio')
+    el.pause(); el.src = ''
+    elAudioPlaying = false
     document.getElementById('tts-play').style.display = 'inline-block'
     document.getElementById('tts-stop').style.display = 'none'
   })
@@ -467,11 +509,19 @@ function buildHomeHtml() {
       const box = document.getElementById('answer-box')
       box.style.display = 'block'
       box.textContent = msg.answer
-      if (autoSpeak) speak(msg.answer)
-      if (voiceOn) {
+      if (autoSpeak) {
+        speak(msg.answer)
+        // For SpeechSynthesis path (no ElevenLabs key), restart listen loop immediately
+        if (!elevenLabsApiKey && voiceOn) listenForWakeWord()
+        // For ElevenLabs path, el.onended inside speak() handles restarting the loop
+      } else if (voiceOn) {
         micDot.className = 'mic-indicator listening'
         voiceStat.textContent = '👂 Listening for "Hey DevLog"…'
+        listenForWakeWord()
       }
+    } else if (msg.type === 'configure') {
+      elevenLabsApiKey  = msg.elevenLabsApiKey  || ''
+      elevenLabsVoiceId = msg.elevenLabsVoiceId || '21m00Tcm4TlvDq8ikWAM'
     } else if (msg.type === 'result') {
       await renderResult(msg.label, msg.data)
     }

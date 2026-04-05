@@ -47,7 +47,7 @@ def load_settings() -> Settings:
         use_firestore=_truthy(os.getenv("DEVLOG_USE_FIRESTORE")),
         google_cloud_project=os.getenv("DEVLOG_GOOGLE_CLOUD_PROJECT"),
         gcp_location=os.getenv("DEVLOG_GCP_LOCATION", "us-central1"),
-        gemini_model=os.getenv("DEVLOG_GEMINI_MODEL", "gemini-2.5-flash"),
+        gemini_model=os.getenv("DEVLOG_GEMINI_MODEL", "gemini-2.5-pro"),
     )
 
 
