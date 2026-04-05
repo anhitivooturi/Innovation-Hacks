@@ -1,0 +1,68 @@
+@import url('https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: light;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply min-h-screen bg-dashboard-glow font-body text-ink antialiased;
+  }
+
+  * {
+    @apply border-transparent;
+  }
+}
+
+@layer components {
+  .dashboard-shell {
+    @apply mx-auto max-w-[1520px] px-4 py-6 sm:px-6 lg:px-8 lg:py-8;
+  }
+
+  .panel {
+    @apply rounded-[34px] border border-white/70 bg-white/80 p-6 shadow-panel backdrop-blur md:p-8;
+  }
+
+  .eyebrow {
+    @apply text-xs font-semibold uppercase tracking-[0.24em] text-ink/50;
+  }
+
+  .section-title {
+    @apply mt-2 font-display text-2xl text-ink sm:text-[2rem];
+  }
+
+  .markdown-content h1,
+  .markdown-content h2,
+  .markdown-content h3 {
+    @apply font-display text-ink;
+  }
+
+  .markdown-content h1 {
+    @apply text-3xl;
+  }
+
+  .markdown-content h2 {
+    @apply mt-5 text-2xl;
+  }
+
+  .markdown-content h3 {
+    @apply mt-4 text-xl;
+  }
+
+  .markdown-content p,
+  .markdown-content li {
+    @apply mt-3 leading-7 text-ink/75;
+  }
+
+  .markdown-content ul {
+    @apply mt-3 list-disc space-y-1 pl-5;
+  }
+}
