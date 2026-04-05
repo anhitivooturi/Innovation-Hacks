@@ -1,5 +1,7 @@
 const vscode = require('vscode')
 
+const { getBaseUrl, getProjectId } = require('./config')
+
 // Collects file tree, diagnostics, git history and POSTs to /context every 30s
 class ContextHarvester {
   constructor(output) {
@@ -41,8 +43,11 @@ class ContextHarvester {
   async _getFileTree() {
     const folders = vscode.workspace.workspaceFolders
     if (!folders) return []
-    const root = folders[0].uri
-    const entries = await vscode.workspace.findFiles('**/*', '{**/node_modules/**,**/.git/**,**/dist/**,**/__pycache__/**}', 200)
+    const entries = await vscode.workspace.findFiles(
+      '**/*',
+      '{**/node_modules/**,**/.git/**,**/dist/**,**/__pycache__/**,**/.venv/**,**/.venv313/**,**/devlog/**,**/.tmp_extension_branch/**}',
+      200,
+    )
     return entries.map(uri => vscode.workspace.asRelativePath(uri, false).replace(/\\/g, '/'))
   }
 
@@ -84,13 +89,8 @@ class ContextHarvester {
   }
 }
 
-function getProjectId() {
-  return vscode.workspace.getConfiguration('devlog').get('projectId', 'default')
-}
-
 async function postJson(path, body, output) {
-  const baseUrl = vscode.workspace.getConfiguration('devlog').get('apiBaseUrl', 'http://127.0.0.1:8000')
-  const res = await fetch(`${baseUrl}${path}`, {
+  const res = await fetch(`${getBaseUrl().replace(/\/$/, '')}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),

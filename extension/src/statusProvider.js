@@ -1,26 +1,27 @@
 const vscode = require('vscode')
 
-// Polls /devlog every 10s and drives status bar + file decorations
+const { getBaseUrl, getProjectId, shouldShowStatusBar } = require('./config')
+
 class StatusProvider {
   constructor(output) {
     this.output = output
     this.statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99)
     this.statusBar.command = 'devlog.openPanel'
-    this._decorationType = this._buildDecorationType()
-    this._state = null
     this._timer = null
-    // file-level status map: filePath -> { status, reason, classification }
+    this._state = null
     this._fileStatus = {}
   }
 
   start() {
+    if (!shouldShowStatusBar()) return
     this.statusBar.show()
-    this._poll()
-    this._timer = setInterval(() => this._poll(), 10_000)
+    void this.pollNow()
+    this._timer = setInterval(() => void this.pollNow(), 10000)
   }
 
   stop() {
     if (this._timer) clearInterval(this._timer)
+    this._timer = null
     this.statusBar.dispose()
   }
 
@@ -32,17 +33,22 @@ class StatusProvider {
     return this._fileStatus[filePath] || null
   }
 
-  async _poll() {
+  async pollNow() {
     try {
-      const baseUrl = vscode.workspace.getConfiguration('devlog').get('apiBaseUrl', 'http://127.0.0.1:8000')
-      const res = await fetch(`${baseUrl}/devlog?projectId=${getProjectId()}`)
-      if (!res.ok) return
-      const data = await res.json()
+      const response = await fetch(`${getBaseUrl().replace(/\/$/, '')}/devlog?projectId=${encodeURIComponent(getProjectId())}`)
+      if (!response.ok) {
+        throw new Error(`Status poll failed: ${response.status}`)
+      }
+      const data = await response.json()
       this._state = data
-      this._updateStatusBar(data)
       this._updateFileStatus(data)
+      this._updateStatusBar(data)
+      return data
     } catch (err) {
-      this.output.appendLine(`[StatusProvider] ${err.message}`)
+      this.statusBar.text = '$(error) DevLog offline'
+      this.statusBar.tooltip = err.message
+      this.output.appendLine(`[status] ${err.message}`)
+      return null
     }
   }
 
@@ -50,48 +56,37 @@ class StatusProvider {
     const health = data.projectHealth || (data.risks?.length ? 'yellow' : 'green')
     const icon = health === 'red' ? '$(error)' : health === 'yellow' ? '$(warning)' : '$(pass)'
     const todos = (data.activeTodos || []).length
-    const ts = data.updatedAt ? new Date(data.updatedAt).toLocaleTimeString() : '—'
-    this.statusBar.text = `${icon} DevLog  ${todos} todo${todos !== 1 ? 's' : ''}  ${ts}`
-    this.statusBar.tooltip = `Project health: ${health}\nLast update: ${ts}`
+    const updatedAt = data.updatedAt || data.last_updated
+    const timeLabel = updatedAt ? new Date(updatedAt).toLocaleTimeString() : '--'
+    this.statusBar.text = `${icon} DevLog ${todos} todo${todos === 1 ? '' : 's'} ${timeLabel}`
+    this.statusBar.tooltip = `Project health: ${health}\nLast update: ${timeLabel}`
     this.statusBar.backgroundColor = health === 'red'
       ? new vscode.ThemeColor('statusBarItem.errorBackground')
       : undefined
   }
 
   _updateFileStatus(data) {
-    // Build file status from timeline risk flags
     this._fileStatus = {}
-    for (const entry of (data.timeline || [])) {
-      if (!this._fileStatus[entry.filePath]) {
-        this._fileStatus[entry.filePath] = {
-          status: entry.riskFlag ? 'danger' : 'working',
-          reason: entry.riskFlag || entry.summary,
-          classification: entry.classification,
-          lastChanged: entry.timestamp,
-        }
+    for (const entry of data.timeline || []) {
+      if (!entry.filePath || this._fileStatus[entry.filePath]) continue
+      this._fileStatus[entry.filePath] = {
+        status: entry.riskFlag ? 'danger' : 'working',
+        reason: entry.riskFlag || entry.summary,
+        classification: entry.classification,
+        lastChanged: entry.timestamp,
       }
     }
-    // Mark danger zones explicitly
-    for (const risk of (data.risks || [])) {
-      const match = risk.match(/Review (.+?);/)
-      if (match) {
-        const fp = match[1]
-        if (this._fileStatus[fp]) this._fileStatus[fp].status = 'danger'
-        else this._fileStatus[fp] = { status: 'danger', reason: risk }
+    for (const risk of data.risks || []) {
+      const match = String(risk).match(/Review\s+(.+?)(?:[.;]|$)/i)
+      if (!match) continue
+      const filePath = match[1]
+      this._fileStatus[filePath] = {
+        ...(this._fileStatus[filePath] || {}),
+        status: 'danger',
+        reason: risk,
       }
     }
   }
-
-  _buildDecorationType() {
-    return vscode.window.createTextEditorDecorationType({
-      gutterIconPath: undefined, // gutter icons set per-editor below
-      overviewRulerLane: vscode.OverviewRulerLane.Right,
-    })
-  }
-}
-
-function getProjectId() {
-  return vscode.workspace.getConfiguration('devlog').get('projectId', 'default')
 }
 
 module.exports = { StatusProvider }

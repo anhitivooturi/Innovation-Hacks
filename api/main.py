@@ -1,1072 +1,865 @@
-"""
-DevLog AI - FastAPI Backend
-Receives file changes, logs decisions, and maintains the living devlog document.
-Syncs all data to Firestore for real-time updates.
-"""
+from __future__ import annotations
 
-import sys
+import json
+import re
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-# Import Gemini agent
-sys.path.append(str(Path(__file__).parent.parent))
-from agent.gemini import analyze_change_with_gemini, answer_query, generate_handoff
-
-# Firebase Admin SDK
-import firebase_admin
-from firebase_admin import credentials, firestore
-
-# ============================================================================
-# Firebase Initialization
-# ============================================================================
-
-FIRESTORE_AVAILABLE = False
-db = None
+from .brain import VertexBrain
+from .config import settings
+from .repo_tools import ApiRepoTools
 
 try:
-    # Initialize Firebase Admin SDK (uses default credentials)
-    # In Cloud Run: automatic via service account
-    # Locally: set GOOGLE_APPLICATION_CREDENTIALS env var
-
-    if not firebase_admin._apps:
-        firebase_admin.initialize_app()
-
-    db = firestore.client()
-    FIRESTORE_AVAILABLE = True
-
-    print("✅ Firestore initialized")
-
-except Exception as e:
-    print(f"⚠️  Firestore initialization failed: {e}")
-    print("📝 Firestore features disabled - using local-only mode")
+    import firebase_admin
+    from firebase_admin import firestore
+except Exception:  # pragma: no cover
+    firebase_admin = None
+    firestore = None
 
 
-# Initialize FastAPI app
 app = FastAPI(
     title="DevLog AI API",
-    description="Background agent that tracks project changes and maintains a living devlog",
-    version="1.0.0"
+    description="Local-first API for the DevLog VS Code extension.",
+    version="2.0.0",
 )
-
-# Enable CORS on all routes
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Constants
-DEVLOG_PATH = Path("devlog/project.md")
-PROJECT_ROOT = Path.cwd()
+
+DEVLOG_PATH = settings.devlog_path
+CACHE_PATH = settings.cache_path
+PROJECT_ROOT = settings.project_root
+
+FIRESTORE_AVAILABLE = False
+FIRESTORE_ERROR: str | None = None
+db = None
+
+if firebase_admin is not None and firestore is not None:
+    try:
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app()
+        db = firestore.client()
+        FIRESTORE_AVAILABLE = True
+        print("[DevLog API] Firestore initialized.")
+    except Exception as exc:  # pragma: no cover - depends on local auth
+        FIRESTORE_ERROR = str(exc)
+        print(f"[DevLog API] Firestore unavailable: {exc}")
+else:
+    FIRESTORE_ERROR = "firebase-admin is not installed."
 
 
-# ============================================================================
-# Request/Response Models
-# ============================================================================
+brain = VertexBrain()
+repo_tools = ApiRepoTools(PROJECT_ROOT)
+
 
 class ChangeEvent(BaseModel):
-    """File change event from the watcher"""
+    project_id: str = "default"
     timestamp: str
     file_path: str
-    event_type: str  # created, modified, deleted
+    event_type: str
     diff: str
-    old_content: Optional[str] = None
-    new_content: Optional[str] = None
+    old_content: str | None = None
+    new_content: str | None = None
     lines_added: int = 0
     lines_removed: int = 0
 
 
-class QueryRequest(BaseModel):
-    """Query request for asking questions about the project"""
-    question: str
-
-
-class HandoffRequest(BaseModel):
-    """Handoff document generation request"""
-    recipient: Optional[str] = None
-
-
-class MCPLogDecision(BaseModel):
-    """MCP server decision log entry"""
-    type: str  # e.g., "architecture", "refactor", "bugfix"
-    content: str
-    source: str  # e.g., "Claude Code", "VS Code Extension"
-
-
-class StatusResponse(BaseModel):
-    """Standard status response"""
-    status: str
-    message: str
+class ContextRequest(BaseModel):
+    projectId: str = "default"
+    fileTree: list[str] = Field(default_factory=list)
+    diagnostics: list[dict[str, Any]] = Field(default_factory=list)
+    gitLog: list[dict[str, Any]] = Field(default_factory=list)
     timestamp: str
 
 
-class DevlogResponse(BaseModel):
-    """Devlog content response"""
+class QueryRequest(BaseModel):
+    projectId: str = "default"
+    question: str | None = None
+    query: str | None = None
+
+
+class HandoffRequest(BaseModel):
+    projectId: str = "default"
+    recipient: str | None = None
+
+
+class ExplainFileRequest(BaseModel):
+    projectId: str = "default"
+    filePath: str
+    selectionStartLine: int | None = None
+    selectionEndLine: int | None = None
+
+
+class DiagramRequest(BaseModel):
+    projectId: str = "default"
+    kind: str
+    filePath: str | None = None
+
+
+class ArchitectureRequest(BaseModel):
+    projectId: str = "default"
+
+
+class SearchCodeRequest(BaseModel):
+    projectId: str = "default"
+    query: str
+    limit: int = Field(default=8, ge=1, le=20)
+
+
+class SnapshotRequest(BaseModel):
+    projectId: str = "default"
+    reason: str = "Manual snapshot"
+
+
+class MCPLogDecision(BaseModel):
+    projectId: str = "default"
+    type: str
     content: str
-    last_updated: str
+    source: str
 
 
-class ProjectContextResponse(BaseModel):
-    """Project context for MCP servers"""
-    project_id: str
-    content: str
-    last_updated: str
+def iso_now() -> str:
+    return datetime.now().isoformat()
 
 
-# ============================================================================
-# Helper Functions
-# ============================================================================
-
-def ensure_devlog_exists():
-    """Ensure the devlog file and directory exist"""
+def ensure_paths() -> None:
     DEVLOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-
+    CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     if not DEVLOG_PATH.exists():
-        print("⚠️  devlog/project.md not found - creating empty file")
-        DEVLOG_PATH.write_text("", encoding='utf-8')
+        DEVLOG_PATH.write_text("", encoding="utf-8")
+    if not CACHE_PATH.exists():
+        CACHE_PATH.write_text(json.dumps({"projects": {}}), encoding="utf-8")
 
 
 def read_devlog() -> str:
-    """Read the current devlog content"""
-    ensure_devlog_exists()
-    return DEVLOG_PATH.read_text(encoding='utf-8')
+    ensure_paths()
+    return DEVLOG_PATH.read_text(encoding="utf-8")
 
 
-def append_to_devlog(content: str):
-    """Append content to the devlog"""
-    ensure_devlog_exists()
-
-    with open(DEVLOG_PATH, 'a', encoding='utf-8') as f:
-        f.write(content)
+def write_devlog(content: str) -> None:
+    ensure_paths()
+    DEVLOG_PATH.write_text(content, encoding="utf-8")
 
 
-def sync_to_firestore(collection: str, doc_id: str, data: dict):
-    """
-    Sync data to Firestore collection.
-    Gracefully handles Firestore being unavailable.
+def append_to_devlog(content: str) -> None:
+    ensure_paths()
+    with DEVLOG_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(content)
 
-    Args:
-        collection: Firestore collection name
-        doc_id: Document ID
-        data: Data to write
-    """
-    if not FIRESTORE_AVAILABLE:
-        return
 
+def load_cache() -> dict[str, Any]:
+    ensure_paths()
     try:
-        db.collection(collection).document(doc_id).set(data, merge=True)
-        print(f"✅ Synced to Firestore: {collection}/{doc_id}")
-    except Exception as e:
-        print(f"⚠️  Firestore sync failed: {collection}/{doc_id} - {e}")
+        return json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"projects": {}}
 
 
-def add_to_firestore_collection(collection: str, data: dict) -> Optional[str]:
-    """
-    Add document to Firestore collection with auto-generated ID.
-
-    Args:
-        collection: Firestore collection name
-        data: Data to write
-
-    Returns:
-        Document ID if successful, None otherwise
-    """
-    if not FIRESTORE_AVAILABLE:
-        return None
-
-    try:
-        doc_ref = db.collection(collection).add(data)
-        doc_id = doc_ref[1].id
-        print(f"✅ Added to Firestore: {collection}/{doc_id}")
-        return doc_id
-    except Exception as e:
-        print(f"⚠️  Firestore add failed: {collection} - {e}")
-        return None
+def save_cache(data: dict[str, Any]) -> None:
+    ensure_paths()
+    CACHE_PATH.write_text(json.dumps(data, ensure_ascii=True, indent=2), encoding="utf-8")
 
 
-def format_change_entry(change: ChangeEvent) -> str:
-    """Format a change event as plain English markdown entry"""
-    timestamp = datetime.fromisoformat(change.timestamp).strftime("%Y-%m-%d %H:%M:%S")
-
-    # Determine action verb
-    if change.event_type == "created":
-        action = "Created"
-    elif change.event_type == "modified":
-        action = "Modified"
-    elif change.event_type == "deleted":
-        action = "Deleted"
-    else:
-        action = "Changed"
-
-    # Build plain English entry
-    entry = f"""
-**{timestamp}** — {action} `{change.file_path}`
-- Lines: +{change.lines_added} -{change.lines_removed}
-
-"""
-    return entry
-
-
-def enrich_with_gemini(filepath: str, diff: str, content: str, change_id: str):
-    """
-    Background task to enrich the devlog with Gemini structured analysis.
-    Uses Gemini to analyze the change and append structured insights to devlog.
-    Also syncs structured data to Firestore.
-
-    Args:
-        filepath: Path to changed file
-        diff: Diff content
-        content: Full file content
-        change_id: ID of the change document in Firestore
-    """
-    try:
-        print(f"🤖 Background: Analyzing {filepath} with Gemini...")
-
-        # Get structured analysis from Gemini
-        analysis = analyze_change_with_gemini(filepath, content, diff)
-
-        # Build enriched entry
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        iso_timestamp = datetime.now().isoformat()
-
-        danger_warning = ""
-        if analysis.get("danger", False):
-            danger_warning = f"\n⚠️  **DANGER**: {analysis.get('reason', 'Unknown risk')}"
-
-        todos_section = ""
-        if analysis.get("todos") and len(analysis["todos"]) > 0:
-            todos_section = "\n📝 **Action Items**:\n" + "\n".join([f"  - {todo}" for todo in analysis["todos"]])
-
-        affected_section = ""
-        if analysis.get("affected_files") and len(analysis["affected_files"]) > 1:
-            affected_section = "\n🔗 **May affect**: " + ", ".join([f"`{f}`" for f in analysis["affected_files"][:3]])
-
-        entry = f"""
-
-### {timestamp} — {analysis.get('classification', 'change').upper()}
-
-**File**: `{filepath}`
-
-**Summary**: {analysis.get('summary', 'No summary available')}{danger_warning}{todos_section}{affected_section}
-
----
-"""
-
-        # Append to devlog file
-        append_to_devlog(entry)
-
-        # Sync structured data to Firestore collections
-        if FIRESTORE_AVAILABLE:
-            # Update the change document with analysis
-            sync_to_firestore("changes", change_id, {
-                "summary": analysis.get("summary", "No summary"),
-                "classification": analysis.get("classification", "modification"),
-                "danger": analysis.get("danger", False),
-                "reason": analysis.get("reason", ""),
-                "analyzed_at": iso_timestamp
-            })
-
-            # Add todos to todos collection
-            if analysis.get("todos"):
-                for todo in analysis["todos"]:
-                    add_to_firestore_collection("todos", {
-                        "title": todo,  # Frontend expects 'title'
-                        "text": todo,
-                        "file": filepath,
-                        "change_id": change_id,
-                        "state": "todo",  # Frontend expects 'state'
-                        "completed": False,
-                        "createdAt": iso_timestamp,
-                        "updatedAt": iso_timestamp,  # Frontend queries by updatedAt
-                        "timestamp": iso_timestamp
-                    })
-
-            # Add to danger_zones if dangerous
-            if analysis.get("danger", False):
-                add_to_firestore_collection("danger_zones", {
-                    "file": filepath,
-                    "reason": analysis.get("reason", "Unknown risk"),
-                    "change_id": change_id,
-                    "created_at": iso_timestamp,
-                    "resolved": False
-                })
-
-            # Update devlog/current document
-            devlog_content = read_devlog()
-            sync_to_firestore("devlog", "current", {
-                "content": devlog_content,
-                "last_updated": iso_timestamp,
-                "last_change": filepath,
-                "last_classification": analysis.get("classification", "modification")
-            })
-
-        print(f"✅ Background: Gemini analysis appended for {filepath}")
-        print(f"   Classification: {analysis.get('classification', 'unknown')}")
-        print(f"   Danger: {analysis.get('danger', False)}")
-
-    except Exception as e:
-        print(f"❌ Background: Gemini enrichment failed for {filepath}: {e}")
-
-
-# ============================================================================
-# API Endpoints
-# ============================================================================
-
-@app.get("/")
-async def root():
-    """Root endpoint with API info"""
-    print("📍 GET / - API info requested")
+def default_project_record(project_id: str) -> dict[str, Any]:
     return {
-        "name": "DevLog AI API",
-        "version": "1.0.0",
-        "status": "running",
-        "firestore_enabled": FIRESTORE_AVAILABLE,
-        "endpoints": {
-            "POST /change": "Receive file change events from watcher",
-            "GET /devlog": "Get current devlog content",
-            "POST /query": "Ask questions about the project",
-            "POST /handoff": "Generate handoff documentation",
-            "POST /snapshot": "Create a devlog snapshot",
-            "GET /snapshots": "List all snapshots",
-            "POST /restore/{snapshot_id}": "Restore from snapshot",
-            "GET /mcp": "MCP server info (Model Context Protocol)",
-            "POST /mcp": "MCP JSON-RPC handler (tools/list, tools/call)",
-            "POST /mcp/log_decision": "Legacy REST endpoint for logging decisions",
-            "GET /mcp/get_project_context/{project_id}": "Legacy REST endpoint for project context",
-            "GET /health": "Health check"
+        "projectId": project_id,
+        "workspaceContext": {
+            "fileTree": [],
+            "diagnostics": [],
+            "gitLog": [],
+            "timestamp": None,
         },
-        "mcp_tools": [
-            "log_decision",
-            "get_project_context",
-            "flag_danger_zone",
-            "get_last_changes"
-        ]
+        "timeline": [],
+        "activeTodos": [],
+        "risks": [],
+        "updatedAt": None,
+        "lastUpdated": None,
     }
 
 
-@app.post("/change", response_model=StatusResponse)
-async def receive_change(change: ChangeEvent, background_tasks: BackgroundTasks):
-    """
-    Receive a file change event from the watcher.
-    Immediately writes to Firestore and devlog, then enriches with Gemini in background.
-    """
+def get_project_record(project_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    cache = load_cache()
+    project = cache.setdefault("projects", {}).setdefault(project_id, default_project_record(project_id))
+    return cache, project
+
+
+def sync_document(collection: str, doc_id: str, data: dict[str, Any]) -> None:
+    if not FIRESTORE_AVAILABLE or db is None:
+        return
     try:
-        print(f"📝 POST /change - {change.file_path} ({change.event_type})")
+        db.collection(collection).document(doc_id).set(data, merge=True)
+    except Exception as exc:
+        mark_firestore_unavailable(exc)
 
-        timestamp = datetime.now().isoformat()
 
-        # STEP 1: Write raw diff to devlog file immediately (never block)
-        entry = format_change_entry(change)
-        append_to_devlog(entry)
+def add_document(collection: str, data: dict[str, Any]) -> str | None:
+    if not FIRESTORE_AVAILABLE or db is None:
+        return None
+    try:
+        doc_ref = db.collection(collection).add(data)
+        return doc_ref[1].id
+    except Exception as exc:
+        mark_firestore_unavailable(exc)
+        return None
 
-        print(f"✅ Logged raw change: {change.file_path}")
 
-        # STEP 2: Sync to Firestore immediately (initial entry)
-        change_data = {
-            "timestamp": timestamp,
+def update_document(collection: str, doc_id: str, data: dict[str, Any]) -> None:
+    if not FIRESTORE_AVAILABLE or db is None:
+        return
+    try:
+        db.collection(collection).document(doc_id).set(data, merge=True)
+    except Exception as exc:
+        mark_firestore_unavailable(exc)
+
+
+def fetch_document(collection: str, doc_id: str) -> dict[str, Any] | None:
+    if not FIRESTORE_AVAILABLE or db is None:
+        return None
+    try:
+        snap = db.collection(collection).document(doc_id).get()
+        if not snap.exists:
+            return None
+        data = snap.to_dict() or {}
+        data["id"] = snap.id
+        return data
+    except Exception as exc:
+        mark_firestore_unavailable(exc)
+        return None
+
+
+def fetch_collection(
+    collection: str,
+    *,
+    order_field: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    if not FIRESTORE_AVAILABLE or db is None:
+        return []
+    query = db.collection(collection)
+    if order_field and firestore is not None:
+        query = query.order_by(order_field, direction=firestore.Query.DESCENDING)
+    query = query.limit(limit)
+    items: list[dict[str, Any]] = []
+    try:
+        for snap in query.stream():
+            data = snap.to_dict() or {}
+            data["id"] = snap.id
+            items.append(data)
+    except Exception as exc:
+        mark_firestore_unavailable(exc)
+        return []
+    return items
+
+
+def mark_firestore_unavailable(exc: Exception) -> None:
+    global FIRESTORE_AVAILABLE, FIRESTORE_ERROR, db
+    FIRESTORE_AVAILABLE = False
+    FIRESTORE_ERROR = str(exc)
+    db = None
+    print(f"[DevLog API] Firestore disabled at runtime: {exc}")
+
+
+def probe_firestore_access() -> None:
+    if not FIRESTORE_AVAILABLE or db is None:
+        return
+    try:
+        list(db.collection("_devlog_healthcheck").limit(1).stream())
+    except Exception as exc:
+        mark_firestore_unavailable(exc)
+
+
+def project_matches(item: dict[str, Any], project_id: str) -> bool:
+    return item.get("project_id", project_id) == project_id
+
+
+def format_change_entry(change: ChangeEvent) -> str:
+    return (
+        f"\n**{change.timestamp}** - {change.event_type.capitalize()} `{change.file_path}`\n"
+        f"- Lines: +{change.lines_added} -{change.lines_removed}\n\n"
+    )
+
+
+def format_analysis_entry(change: ChangeEvent, analysis: dict[str, Any]) -> str:
+    danger = ""
+    if analysis.get("danger"):
+        danger = f"\n- Risk: {analysis.get('reason', 'Review this change.')}"
+    todos = analysis.get("todos") or []
+    todo_line = ""
+    if todos:
+        todo_line = "\n- Todos: " + "; ".join(str(item) for item in todos[:4])
+    return (
+        f"### {analysis.get('classification', 'change').upper()} - `{change.file_path}`\n"
+        f"- Summary: {analysis.get('summary', 'No summary available.')}"
+        f"{danger}{todo_line}\n\n"
+    )
+
+
+def compute_health(risks: list[str], todos: list[str]) -> str:
+    if risks:
+        return "red"
+    if len(todos) >= 5:
+        return "yellow"
+    return "green"
+
+
+def unique_list(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def push_timeline_entry(project: dict[str, Any], entry: dict[str, Any]) -> None:
+    remaining = [item for item in project["timeline"] if item.get("id") != entry.get("id")]
+    project["timeline"] = [entry] + remaining
+    project["timeline"] = project["timeline"][:40]
+
+
+def build_local_payload(project_id: str) -> dict[str, Any]:
+    _, project = get_project_record(project_id)
+    content = read_devlog()
+    project["updatedAt"] = project.get("updatedAt") or iso_now()
+    project["lastUpdated"] = project.get("lastUpdated") or project["updatedAt"]
+    return {
+        "projectId": project_id,
+        "content": content,
+        "last_updated": project["lastUpdated"],
+        "updatedAt": project["updatedAt"],
+        "projectHealth": compute_health(project["risks"], project["activeTodos"]),
+        "activeTodos": project["activeTodos"],
+        "risks": project["risks"],
+        "timeline": project["timeline"],
+        "workspaceContext": project["workspaceContext"],
+    }
+
+
+def build_project_payload(project_id: str) -> dict[str, Any]:
+    payload = build_local_payload(project_id)
+
+    if not FIRESTORE_AVAILABLE:
+        return payload
+
+    try:
+        devlog_doc = fetch_document("devlog", "current")
+        status_doc = fetch_document("status", "current")
+        context_doc = fetch_document("workspace_context", project_id)
+        changes = [
+            item
+            for item in fetch_collection("changes", order_field="timestamp", limit=30)
+            if project_matches(item, project_id)
+        ]
+        todos = [
+            item
+            for item in fetch_collection("todos", order_field="updatedAt", limit=30)
+            if project_matches(item, project_id)
+        ]
+        danger_zones = [
+            item
+            for item in fetch_collection("danger_zones", order_field="created_at", limit=20)
+            if project_matches(item, project_id) and not item.get("resolved", False)
+        ]
+    except Exception:
+        return payload
+
+    timeline = []
+    for item in changes:
+        timeline.append(
+            {
+                "id": item.get("id"),
+                "timestamp": item.get("timestamp"),
+                "filePath": item.get("filePath") or item.get("file") or "unknown",
+                "classification": item.get("classification", "unknown"),
+                "summary": item.get("summary", "No summary"),
+                "riskFlag": item.get("reason") if item.get("danger") else None,
+            }
+        )
+
+    active_todos = [
+        item.get("title") or item.get("text") or item.get("task")
+        for item in todos
+        if (item.get("state") or item.get("status") or "todo") not in {"done", "completed", "resolved"}
+    ]
+    risks = [item.get("reason") or f"Review {item.get('file', 'unknown')}." for item in danger_zones]
+
+    if devlog_doc:
+        payload["content"] = devlog_doc.get("content", payload["content"])
+        payload["last_updated"] = devlog_doc.get("last_updated") or devlog_doc.get("lastUpdated") or payload["last_updated"]
+    if status_doc:
+        payload["projectHealth"] = status_doc.get("projectHealth", payload["projectHealth"])
+        payload["updatedAt"] = status_doc.get("lastUpdated") or status_doc.get("updatedAt") or payload["updatedAt"]
+    if context_doc:
+        payload["workspaceContext"] = {
+            "fileTree": context_doc.get("fileTree", []),
+            "diagnostics": context_doc.get("diagnostics", []),
+            "gitLog": context_doc.get("gitLog", []),
+            "timestamp": context_doc.get("timestamp"),
+        }
+
+    if timeline:
+        payload["timeline"] = timeline
+    if active_todos:
+        payload["activeTodos"] = unique_list([item for item in active_todos if item])
+    if risks:
+        payload["risks"] = unique_list([item for item in risks if item])
+
+    if not status_doc:
+        payload["projectHealth"] = compute_health(payload["risks"], payload["activeTodos"])
+
+    return payload
+
+
+def build_prompt_context(project_id: str) -> dict[str, Any]:
+    payload = build_project_payload(project_id)
+    return {
+        "project_id": project_id,
+        "workspace_snapshot": payload.get("workspaceContext", {}),
+        "recent_changes": payload.get("timeline", [])[:12],
+        "active_todos": payload.get("activeTodos", [])[:10],
+        "risks": payload.get("risks", [])[:10],
+        "devlog_excerpt": payload.get("content", "")[-5000:],
+    }
+
+
+def collect_query_matches(question: str) -> list[dict[str, Any]]:
+    keywords = [token.lower() for token in re.findall(r"[A-Za-z0-9_./-]+", question) if len(token) >= 4]
+    seen: set[tuple[str, int | None]] = set()
+    matches: list[dict[str, Any]] = []
+    for keyword in keywords[:6]:
+        try:
+            for match in repo_tools.search_code(keyword, limit=2):
+                item = json_ready(match)
+                key = (item.get("filePath", ""), item.get("line"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                matches.append(item)
+                if len(matches) >= 8:
+                    return matches
+        except Exception:
+            continue
+    return matches
+
+
+def publish_state(project_id: str) -> None:
+    payload = build_local_payload(project_id)
+    payload["projectHealth"] = compute_health(payload["risks"], payload["activeTodos"])
+    payload["updatedAt"] = iso_now()
+    payload["last_updated"] = payload["updatedAt"]
+
+    cache, project = get_project_record(project_id)
+    project["updatedAt"] = payload["updatedAt"]
+    project["lastUpdated"] = payload["last_updated"]
+    save_cache(cache)
+
+    sync_document(
+        "devlog",
+        "current",
+        {
+            "project_id": project_id,
+            "content": read_devlog(),
+            "last_updated": payload["last_updated"],
+        },
+    )
+    sync_document(
+        "status",
+        "current",
+        {
+            "project_id": project_id,
+            "projectHealth": payload["projectHealth"],
+            "lastUpdated": payload["updatedAt"],
+            "timelineCount": len(payload["timeline"]),
+            "todoCount": len(payload["activeTodos"]),
+            "riskCount": len(payload["risks"]),
+        },
+    )
+
+
+def enrich_change(change: ChangeEvent, change_id: str) -> None:
+    analysis = brain.summarize_change(
+        file_path=change.file_path,
+        diff=change.diff,
+        content=change.new_content or "",
+        context=build_prompt_context(change.project_id),
+    )
+    append_to_devlog(format_analysis_entry(change, analysis))
+
+    cache, project = get_project_record(change.project_id)
+    entry = {
+        "id": change_id,
+        "timestamp": change.timestamp,
+        "filePath": change.file_path,
+        "classification": analysis.get("classification", "unknown"),
+        "summary": analysis.get("summary", "No summary available."),
+        "riskFlag": analysis.get("reason") if analysis.get("danger") else None,
+    }
+    push_timeline_entry(project, entry)
+    project["activeTodos"] = unique_list(project["activeTodos"] + list(analysis.get("todos") or []))[:25]
+    if analysis.get("danger") and analysis.get("reason"):
+        project["risks"] = unique_list(project["risks"] + [analysis["reason"]])[:20]
+    project["updatedAt"] = iso_now()
+    project["lastUpdated"] = project["updatedAt"]
+    save_cache(cache)
+
+    update_document(
+        "changes",
+        change_id,
+        {
+            "project_id": change.project_id,
+            "filePath": change.file_path,
+            "summary": analysis.get("summary"),
+            "classification": analysis.get("classification", "unknown"),
+            "danger": bool(analysis.get("danger")),
+            "reason": analysis.get("reason"),
+            "todos": analysis.get("todos") or [],
+            "affected_files": analysis.get("affected_files") or [change.file_path],
+            "analyzed": True,
+            "analyzed_at": iso_now(),
+        },
+    )
+    for todo in analysis.get("todos") or []:
+        add_document(
+            "todos",
+            {
+                "project_id": change.project_id,
+                "title": todo,
+                "text": todo,
+                "file": change.file_path,
+                "state": "todo",
+                "updatedAt": iso_now(),
+            },
+        )
+    if analysis.get("danger"):
+        add_document(
+            "danger_zones",
+            {
+                "project_id": change.project_id,
+                "file": change.file_path,
+                "reason": analysis.get("reason", "Review this change."),
+                "created_at": iso_now(),
+                "resolved": False,
+            },
+        )
+
+    publish_state(change.project_id)
+
+
+def normalize_query(request: QueryRequest) -> str:
+    text = (request.question or request.query or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Request requires `question` or `query`.")
+    return text
+
+
+def json_ready(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    if isinstance(value, list):
+        return [json_ready(item) for item in value]
+    if isinstance(value, dict):
+        return {key: json_ready(val) for key, val in value.items()}
+    return value
+
+
+@app.get("/")
+async def root() -> dict[str, Any]:
+    return {
+        "name": "DevLog AI API",
+        "status": "running",
+        "canonical_stack": "api+watcher",
+        "project_root": str(PROJECT_ROOT),
+        "endpoints": [
+            "POST /change",
+            "POST /context",
+            "GET /devlog",
+            "POST /query",
+            "POST /handoff",
+            "POST /explain/file",
+            "POST /diagram",
+            "POST /architecture/map",
+            "POST /search/code",
+            "GET /health",
+        ],
+    }
+
+
+@app.post("/change")
+async def receive_change(change: ChangeEvent, background_tasks: BackgroundTasks) -> dict[str, Any]:
+    ensure_paths()
+    append_to_devlog(format_change_entry(change))
+
+    cache, project = get_project_record(change.project_id)
+    pending_entry = {
+        "id": f"{change.project_id}:{change.timestamp}:{change.file_path}",
+        "timestamp": change.timestamp,
+        "filePath": change.file_path,
+        "classification": "pending",
+        "summary": f"{change.event_type.capitalize()} {change.file_path}",
+        "riskFlag": None,
+    }
+    push_timeline_entry(project, pending_entry)
+    project["updatedAt"] = iso_now()
+    project["lastUpdated"] = project["updatedAt"]
+    save_cache(cache)
+
+    change_id = add_document(
+        "changes",
+        {
+            "project_id": change.project_id,
+            "timestamp": change.timestamp,
             "file": change.file_path,
+            "filePath": change.file_path,
             "event_type": change.event_type,
             "lines_added": change.lines_added,
             "lines_removed": change.lines_removed,
-            "diff": change.diff[:2000],  # Truncate long diffs
+            "diff": change.diff[:4000],
             "summary": f"{change.event_type.capitalize()} {change.file_path}",
-            "classification": "pending",  # Will be updated by Gemini
+            "classification": "pending",
             "danger": False,
-            "analyzed": False
-        }
+            "analyzed": False,
+        },
+    ) or pending_entry["id"]
 
-        # Add to changes collection and get the document ID
-        change_id = add_to_firestore_collection("changes", change_data)
-
-        if not change_id:
-            # Fallback: use timestamp as ID
-            change_id = timestamp.replace(":", "-").replace(".", "-")
-
-        print(f"✅ Synced to Firestore: changes/{change_id}")
-
-        # STEP 3: Schedule Gemini enrichment as background task
-        background_tasks.add_task(
-            enrich_with_gemini,
-            filepath=change.file_path,
-            diff=change.diff,
-            content=change.new_content or "",
-            change_id=change_id
-        )
-
-        print(f"🔄 Scheduled Gemini enrichment for: {change.file_path}")
-
-        # STEP 4: Return immediately (watcher never times out)
-        return StatusResponse(
-            status="success",
-            message=f"Change logged: {change.file_path}",
-            timestamp=timestamp
-        )
-
-    except Exception as e:
-        print(f"❌ Error logging change: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to log change: {str(e)}")
+    publish_state(change.project_id)
+    background_tasks.add_task(enrich_change, change, change_id)
+    return {
+        "status": "success",
+        "message": f"Change logged for {change.file_path}",
+        "timestamp": iso_now(),
+    }
 
 
-@app.get("/devlog", response_model=DevlogResponse)
-async def get_devlog():
-    """
-    Get the current devlog content.
-    Returns the full project.md content.
-    """
-    try:
-        print("📖 GET /devlog - Returning full devlog")
+@app.post("/context")
+async def store_context(payload: ContextRequest) -> dict[str, Any]:
+    cache, project = get_project_record(payload.projectId)
+    project["workspaceContext"] = {
+        "fileTree": payload.fileTree,
+        "diagnostics": payload.diagnostics,
+        "gitLog": payload.gitLog,
+        "timestamp": payload.timestamp,
+    }
+    project["updatedAt"] = payload.timestamp
+    project["lastUpdated"] = payload.timestamp
+    save_cache(cache)
 
-        content = read_devlog()
+    sync_document(
+        "workspace_context",
+        payload.projectId,
+        {
+            "project_id": payload.projectId,
+            "fileTree": payload.fileTree,
+            "diagnostics": payload.diagnostics,
+            "gitLog": payload.gitLog,
+            "timestamp": payload.timestamp,
+        },
+    )
+    publish_state(payload.projectId)
+    return {"status": "success", "message": "Workspace context stored.", "timestamp": payload.timestamp}
 
-        # Get last updated time
-        stat = DEVLOG_PATH.stat()
-        last_updated = datetime.fromtimestamp(stat.st_mtime).isoformat()
 
-        print(f"✅ Devlog retrieved: {len(content)} chars")
-
-        return DevlogResponse(
-            content=content,
-            last_updated=last_updated
-        )
-
-    except Exception as e:
-        print(f"❌ Error reading devlog: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to read devlog: {str(e)}")
+@app.get("/devlog")
+async def get_devlog(projectId: str = Query(default="default")) -> dict[str, Any]:
+    payload = build_project_payload(projectId)
+    payload["content"] = read_devlog()
+    return payload
 
 
 @app.post("/query")
-async def query_project(query: QueryRequest):
-    """
-    Ask a question about the project using Gemini.
-    """
-    try:
-        print(f"🤔 POST /query - Question: {query.question}")
-
-        # Read current devlog
-        devlog_content = read_devlog()
-
-        # Use Gemini to answer the question
-        answer = answer_query(
-            question=query.question,
-            devlog_content=devlog_content
-        )
-
-        timestamp = datetime.now().isoformat()
-
-        print(f"✅ Query answered")
-
-        return {
-            "status": "success",
-            "message": "Query answered",
-            "timestamp": timestamp,
-            "question": query.question,
-            "answer": answer
-        }
-
-    except Exception as e:
-        print(f"❌ Error answering query: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to answer query: {str(e)}")
+async def query_project(request: QueryRequest) -> dict[str, Any]:
+    question = normalize_query(request)
+    context = build_prompt_context(request.projectId)
+    context["code_matches"] = collect_query_matches(question)
+    answer = brain.answer_query(question=question, context=context)
+    return {
+        "status": "success",
+        "timestamp": iso_now(),
+        "question": question,
+        "answer": answer,
+    }
 
 
 @app.post("/handoff")
-async def generate_handoff_doc(request: HandoffRequest):
-    """
-    Generate a handoff document for the project using Gemini.
-    """
+async def generate_handoff_doc(request: HandoffRequest) -> dict[str, Any]:
+    handoff = brain.generate_handoff(context=build_prompt_context(request.projectId))
+    return {
+        "status": "success",
+        "timestamp": iso_now(),
+        "recipient": request.recipient,
+        "handoff_document": handoff,
+        "handoff": handoff,
+    }
+
+
+@app.post("/explain/file")
+async def explain_file(request: ExplainFileRequest) -> dict[str, Any]:
     try:
-        print(f"📋 POST /handoff - Recipient: {request.recipient or 'team'}")
+        payload = repo_tools.explain_file(
+            request.filePath,
+            request.selectionStartLine,
+            request.selectionEndLine,
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"File not found: {request.filePath}") from None
 
-        # Read current devlog
-        devlog_content = read_devlog()
-
-        # Use Gemini to generate handoff document
-        handoff_doc = generate_handoff(devlog_content)
-
-        timestamp = datetime.now().isoformat()
-
-        print(f"✅ Handoff document generated")
-
-        return {
-            "status": "success",
-            "message": "Handoff document generated",
-            "timestamp": timestamp,
-            "recipient": request.recipient,
-            "handoff_document": handoff_doc
-        }
-
-    except Exception as e:
-        print(f"❌ Error generating handoff: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate handoff: {str(e)}")
+    enhanced = brain.enhance_explanation(json_ready(payload), build_prompt_context(request.projectId))
+    return json_ready(enhanced)
 
 
-@app.post("/mcp/log_decision", response_model=StatusResponse)
-async def mcp_log_decision(decision: MCPLogDecision):
-    """
-    MCP endpoint to log a decision to the devlog.
-    Allows AI tools to log architectural decisions and important choices.
-    Also syncs to Firestore decisions collection.
-    """
+@app.post("/diagram")
+async def generate_diagram(request: DiagramRequest) -> dict[str, Any]:
+    supported = {"dependency", "flow", "class", "sequence"}
+    if request.kind not in supported:
+        raise HTTPException(status_code=400, detail=f"Unsupported diagram kind: {request.kind}")
+
     try:
-        print(f"💡 POST /mcp/log_decision - {decision.type} from {decision.source}")
+        payload = repo_tools.generate_diagram(request.kind, request.filePath)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"File not found: {request.filePath}") from None
+    enhanced = brain.enhance_diagram(json_ready(payload), build_prompt_context(request.projectId))
+    return json_ready(enhanced)
 
-        timestamp = datetime.now().isoformat()
-        formatted_time = datetime.fromisoformat(timestamp).strftime("%Y-%m-%d %H:%M:%S")
 
-        # Format decision entry
-        entry = f"""
-**{formatted_time}** — Decision: {decision.type}
-- Source: {decision.source}
-- {decision.content}
+@app.post("/architecture/map")
+async def architecture_map(request: ArchitectureRequest) -> dict[str, Any]:
+    payload = repo_tools.architecture_map()
+    enhanced = brain.enhance_architecture(json_ready(payload), build_prompt_context(request.projectId))
+    return json_ready(enhanced)
 
-"""
 
-        # Append to devlog
-        append_to_devlog(entry)
+@app.post("/search/code")
+async def search_code(request: SearchCodeRequest) -> dict[str, Any]:
+    matches = repo_tools.search_code(request.query, limit=request.limit)
+    return {"matches": json_ready(matches)}
 
-        # Sync to Firestore decisions collection
-        decision_data = {
+
+@app.post("/snapshot")
+async def create_snapshot(request: SnapshotRequest) -> dict[str, Any]:
+    content = read_devlog()
+    snapshot = {
+        "project_id": request.projectId,
+        "reason": request.reason,
+        "content": content,
+        "timestamp": iso_now(),
+        "title": request.reason,
+    }
+    snapshot_id = add_document("snapshots", snapshot)
+    if snapshot_id is None:
+        raise HTTPException(status_code=503, detail="Firestore is unavailable; snapshot was not created.")
+    return {
+        "status": "success",
+        "snapshot_id": snapshot_id,
+        "timestamp": snapshot["timestamp"],
+        "reason": request.reason,
+    }
+
+
+@app.get("/snapshots")
+async def list_snapshots(projectId: str = Query(default="default")) -> dict[str, Any]:
+    items = [
+        item
+        for item in fetch_collection("snapshots", order_field="timestamp", limit=25)
+        if project_matches(item, projectId)
+    ]
+    return {"snapshots": items}
+
+
+@app.post("/restore/{snapshot_id}")
+async def restore_snapshot(snapshot_id: str) -> dict[str, Any]:
+    snapshot = fetch_document("snapshots", snapshot_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Snapshot not found.")
+    content = snapshot.get("content", "")
+    write_devlog(content)
+    project_id = snapshot.get("project_id", "default")
+    publish_state(project_id)
+    return {"status": "success", "snapshot_id": snapshot_id, "timestamp": iso_now()}
+
+
+@app.post("/mcp/log_decision")
+async def mcp_log_decision(decision: MCPLogDecision) -> dict[str, Any]:
+    timestamp = iso_now()
+    entry = (
+        f"**{timestamp}** - Decision `{decision.type}`\n"
+        f"- Source: {decision.source}\n"
+        f"- {decision.content}\n\n"
+    )
+    append_to_devlog(entry)
+    add_document(
+        "decisions",
+        {
+            "project_id": decision.projectId,
             "type": decision.type,
             "content": decision.content,
             "source": decision.source,
             "timestamp": timestamp,
-            "created_at": timestamp
-        }
-        add_to_firestore_collection("decisions", decision_data)
-
-        print(f"✅ Decision logged: {decision.type}")
-
-        return StatusResponse(
-            status="success",
-            message=f"Decision logged: {decision.type}",
-            timestamp=timestamp
-        )
-
-    except Exception as e:
-        print(f"❌ Error logging decision: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to log decision: {str(e)}")
+        },
+    )
+    publish_state(decision.projectId)
+    return {"status": "success", "message": f"Decision logged: {decision.type}", "timestamp": timestamp}
 
 
-@app.get("/mcp/get_project_context/{project_id}", response_model=ProjectContextResponse)
-async def mcp_get_project_context(project_id: str):
-    """
-    MCP endpoint to get full project context.
-    Returns the complete devlog for AI tools to understand the project.
-    """
-    try:
-        print(f"🔍 GET /mcp/get_project_context/{project_id}")
-
-        content = read_devlog()
-
-        # Get last updated time
-        stat = DEVLOG_PATH.stat()
-        last_updated = datetime.fromtimestamp(stat.st_mtime).isoformat()
-
-        print(f"✅ Project context retrieved for: {project_id}")
-
-        return ProjectContextResponse(
-            project_id=project_id,
-            content=content,
-            last_updated=last_updated
-        )
-
-    except Exception as e:
-        print(f"❌ Error getting project context: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get project context: {str(e)}")
-
-
-@app.post("/snapshot")
-async def create_snapshot(reason: str = "Manual snapshot"):
-    """
-    Create a snapshot of the current devlog state.
-    Saves to Firestore snapshots collection.
-    """
-    try:
-        print(f"📸 POST /snapshot - Reason: {reason}")
-
-        timestamp = datetime.now().isoformat()
-
-        # Read current devlog
-        devlog_content = read_devlog()
-
-        # Create snapshot data
-        snapshot_data = {
-            "content": devlog_content,
-            "timestamp": timestamp,
-            "reason": reason,
-            "created_at": timestamp
-        }
-
-        # Save to Firestore snapshots collection
-        snapshot_id = add_to_firestore_collection("snapshots", snapshot_data)
-
-        if not snapshot_id:
-            raise HTTPException(status_code=500, detail="Failed to create snapshot (Firestore unavailable)")
-
-        print(f"✅ Snapshot created: {snapshot_id}")
-
-        return {
-            "status": "success",
-            "message": "Snapshot created",
-            "timestamp": timestamp,
-            "snapshot_id": snapshot_id,
-            "reason": reason
-        }
-
-    except Exception as e:
-        print(f"❌ Error creating snapshot: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to create snapshot: {str(e)}")
-
-
-@app.get("/snapshots")
-async def list_snapshots():
-    """
-    List all snapshots with metadata.
-    Returns list of snapshots from Firestore.
-    """
-    try:
-        print("📋 GET /snapshots - Listing all snapshots")
-
-        if not FIRESTORE_AVAILABLE:
-            return {
-                "status": "unavailable",
-                "message": "Firestore not available",
-                "snapshots": []
-            }
-
-        # Query snapshots collection
-        snapshots_ref = db.collection("snapshots").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(20)
-        snapshots = []
-
-        for doc in snapshots_ref.stream():
-            snapshot = doc.to_dict()
-            snapshots.append({
-                "id": doc.id,
-                "timestamp": snapshot.get("timestamp"),
-                "reason": snapshot.get("reason"),
-                "created_at": snapshot.get("created_at")
-            })
-
-        print(f"✅ Retrieved {len(snapshots)} snapshots")
-
-        return {
-            "status": "success",
-            "count": len(snapshots),
-            "snapshots": snapshots
-        }
-
-    except Exception as e:
-        print(f"❌ Error listing snapshots: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to list snapshots: {str(e)}")
-
-
-@app.post("/restore/{snapshot_id}")
-async def restore_snapshot(snapshot_id: str):
-    """
-    Restore devlog from a snapshot.
-    Overwrites current devlog with snapshot content.
-    """
-    try:
-        print(f"♻️  POST /restore/{snapshot_id}")
-
-        if not FIRESTORE_AVAILABLE:
-            raise HTTPException(status_code=503, detail="Firestore not available")
-
-        # Get snapshot from Firestore
-        snapshot_ref = db.collection("snapshots").document(snapshot_id)
-        snapshot = snapshot_ref.get()
-
-        if not snapshot.exists:
-            raise HTTPException(status_code=404, detail=f"Snapshot {snapshot_id} not found")
-
-        snapshot_data = snapshot.to_dict()
-        content = snapshot_data.get("content", "")
-
-        # Write to devlog file
-        ensure_devlog_exists()
-        DEVLOG_PATH.write_text(content, encoding='utf-8')
-
-        timestamp = datetime.now().isoformat()
-
-        print(f"✅ Restored from snapshot: {snapshot_id}")
-
-        return {
-            "status": "success",
-            "message": f"Restored from snapshot {snapshot_id}",
-            "timestamp": timestamp,
-            "snapshot_id": snapshot_id,
-            "restored_from": snapshot_data.get("timestamp")
-        }
-
-    except Exception as e:
-        print(f"❌ Error restoring snapshot: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to restore snapshot: {str(e)}")
+@app.get("/mcp/get_project_context/{project_id}")
+async def mcp_get_project_context(project_id: str) -> dict[str, Any]:
+    payload = build_project_payload(project_id)
+    return {
+        "project_id": project_id,
+        "content": payload.get("content", ""),
+        "last_updated": payload.get("last_updated"),
+        "workspace_context": payload.get("workspaceContext", {}),
+    }
 
 
 @app.get("/health")
-async def health_check():
-    """Health check endpoint"""
+async def health() -> dict[str, Any]:
     return {
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "devlog_exists": DEVLOG_PATH.exists(),
-        "firestore_available": FIRESTORE_AVAILABLE
+        "status": "ok",
+        "canonical_stack": "api+watcher",
+        "timestamp": iso_now(),
+        "project_root": str(PROJECT_ROOT),
+        "firestore_available": FIRESTORE_AVAILABLE,
+        "firestore_error": FIRESTORE_ERROR,
+        "vertex_available": brain.available,
+        "vertex_error": brain.init_error,
+        "project": settings.google_cloud_project,
+        "location": settings.gcp_location,
+        "fast_model": settings.gemini_fast_model,
+        "pro_model": settings.gemini_pro_model,
     }
 
-
-# ============================================================================
-# MCP (Model Context Protocol) JSON-RPC Endpoints
-# ============================================================================
-
-class MCPRequest(BaseModel):
-    """MCP JSON-RPC request"""
-    jsonrpc: str = "2.0"
-    method: str
-    params: Optional[dict] = None
-    id: Optional[Union[str, int]] = None
-
-
-@app.get("/mcp")
-async def mcp_server_info():
-    """
-    MCP server info endpoint.
-    Returns server metadata for MCP clients.
-    """
-    return {
-        "name": "devlog",
-        "version": "1.0.0",
-        "description": "DevLog AI - project memory for AI coding tools",
-        "protocol_version": "2024-11-05"
-    }
-
-
-@app.post("/mcp")
-async def mcp_jsonrpc_handler(request: MCPRequest):
-    """
-    MCP JSON-RPC handler.
-    Handles tools/list and tools/call methods.
-    """
-    try:
-        print(f"🔌 MCP JSON-RPC: {request.method}")
-
-        # Handle initialize
-        if request.method == "initialize":
-            return {
-                "jsonrpc": "2.0",
-                "id": request.id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {
-                        "tools": {}
-                    },
-                    "serverInfo": {
-                        "name": "devlog",
-                        "version": "1.0.0"
-                    }
-                }
-            }
-
-        # Handle notifications/initialized
-        elif request.method == "notifications/initialized":
-            return {
-                "jsonrpc": "2.0",
-                "id": request.id,
-                "result": {
-                    "status": "ok"
-                }
-            }
-
-        # Handle tools/list
-        elif request.method == "tools/list":
-            return {
-                "jsonrpc": "2.0",
-                "id": request.id,
-                "result": {
-                    "tools": [
-                        {
-                            "name": "log_decision",
-                            "description": "Log a decision to the project devlog and Firestore",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "type": {
-                                        "type": "string",
-                                        "description": "Decision type (e.g., architecture, refactor, bugfix)"
-                                    },
-                                    "content": {
-                                        "type": "string",
-                                        "description": "Decision content and rationale"
-                                    },
-                                    "source": {
-                                        "type": "string",
-                                        "description": "Source tool (e.g., Claude Code, Cursor)"
-                                    }
-                                },
-                                "required": ["type", "content", "source"]
-                            }
-                        },
-                        {
-                            "name": "get_project_context",
-                            "description": "Get the full devlog content for project context",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "project_id": {
-                                        "type": "string",
-                                        "description": "Project identifier (default: current)"
-                                    }
-                                },
-                                "required": []
-                            }
-                        },
-                        {
-                            "name": "flag_danger_zone",
-                            "description": "Flag a file or area as dangerous requiring careful review",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "file": {
-                                        "type": "string",
-                                        "description": "File path to flag"
-                                    },
-                                    "reason": {
-                                        "type": "string",
-                                        "description": "Reason why this is dangerous"
-                                    }
-                                },
-                                "required": ["file", "reason"]
-                            }
-                        },
-                        {
-                            "name": "get_last_changes",
-                            "description": "Get the last 5 changes from the project timeline",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {},
-                                "required": []
-                            }
-                        }
-                    ]
-                }
-            }
-
-        # Handle tools/call
-        elif request.method == "tools/call":
-            if not request.params or "name" not in request.params:
-                raise HTTPException(status_code=400, detail="Missing tool name in params")
-
-            tool_name = request.params["name"]
-            tool_args = request.params.get("arguments", {})
-
-            # Execute the requested tool
-            if tool_name == "log_decision":
-                result = await _mcp_log_decision(tool_args)
-            elif tool_name == "get_project_context":
-                result = await _mcp_get_project_context(tool_args)
-            elif tool_name == "flag_danger_zone":
-                result = await _mcp_flag_danger_zone(tool_args)
-            elif tool_name == "get_last_changes":
-                result = await _mcp_get_last_changes(tool_args)
-            else:
-                raise HTTPException(status_code=404, detail=f"Tool not found: {tool_name}")
-
-            return {
-                "jsonrpc": "2.0",
-                "id": request.id,
-                "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": result
-                        }
-                    ]
-                }
-            }
-
-        else:
-            raise HTTPException(status_code=400, detail=f"Unknown method: {request.method}")
-
-    except Exception as e:
-        print(f"❌ MCP JSON-RPC error: {e}")
-        return {
-            "jsonrpc": "2.0",
-            "id": request.id,
-            "error": {
-                "code": -32603,
-                "message": str(e)
-            }
-        }
-
-
-# ============================================================================
-# MCP Tool Implementations
-# ============================================================================
-
-async def _mcp_log_decision(args: dict) -> str:
-    """MCP tool: log_decision"""
-    decision_type = args.get("type", "decision")
-    content = args.get("content", "")
-    source = args.get("source", "MCP Client")
-
-    if not content:
-        raise ValueError("Decision content is required")
-
-    timestamp = datetime.now().isoformat()
-    formatted_time = datetime.fromisoformat(timestamp).strftime("%Y-%m-%d %H:%M:%S")
-
-    # Format decision entry
-    entry = f"""
-**{formatted_time}** — Decision: {decision_type}
-- Source: {source}
-- {content}
-
-"""
-
-    # Append to devlog
-    append_to_devlog(entry)
-
-    # Sync to Firestore decisions collection
-    decision_data = {
-        "type": decision_type,
-        "content": content,
-        "source": source,
-        "timestamp": timestamp,
-        "created_at": timestamp
-    }
-    add_to_firestore_collection("decisions", decision_data)
-
-    print(f"✅ MCP: Decision logged: {decision_type}")
-
-    return f"Decision logged successfully: {decision_type}\nSource: {source}\nContent: {content[:100]}..."
-
-
-async def _mcp_get_project_context(args: dict) -> str:
-    """MCP tool: get_project_context"""
-    project_id = args.get("project_id", "current")
-
-    content = read_devlog()
-
-    # Get last updated time
-    stat = DEVLOG_PATH.stat()
-    last_updated = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-
-    print(f"✅ MCP: Project context retrieved for: {project_id}")
-
-    return f"Project: {project_id}\nLast Updated: {last_updated}\n\n--- DevLog Content ---\n\n{content}"
-
-
-async def _mcp_flag_danger_zone(args: dict) -> str:
-    """MCP tool: flag_danger_zone"""
-    file = args.get("file", "")
-    reason = args.get("reason", "")
-
-    if not file or not reason:
-        raise ValueError("Both file and reason are required")
-
-    timestamp = datetime.now().isoformat()
-    formatted_time = datetime.fromisoformat(timestamp).strftime("%Y-%m-%d %H:%M:%S")
-
-    # Format danger zone entry
-    entry = f"""
-**{formatted_time}** — ⚠️ DANGER ZONE FLAGGED
-- File: `{file}`
-- Reason: {reason}
-
-"""
-
-    # Append to devlog
-    append_to_devlog(entry)
-
-    # Add to danger_zones collection in Firestore
-    add_to_firestore_collection("danger_zones", {
-        "file": file,
-        "reason": reason,
-        "created_at": timestamp,
-        "resolved": False,
-        "flagged_by": "MCP Client"
-    })
-
-    print(f"✅ MCP: Danger zone flagged: {file}")
-
-    return f"Danger zone flagged successfully:\nFile: {file}\nReason: {reason}"
-
-
-async def _mcp_get_last_changes(args: dict) -> str:
-    """MCP tool: get_last_changes"""
-    if not FIRESTORE_AVAILABLE:
-        return "Firestore is not available. Cannot retrieve changes."
-
-    try:
-        # Query last 5 changes from Firestore
-        changes_ref = db.collection("changes").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(5)
-        changes = []
-
-        for doc in changes_ref.stream():
-            change = doc.to_dict()
-            changes.append({
-                "timestamp": change.get("timestamp", ""),
-                "file": change.get("file", ""),
-                "classification": change.get("classification", "unknown"),
-                "summary": change.get("summary", "No summary"),
-                "danger": change.get("danger", False)
-            })
-
-        if not changes:
-            return "No changes found in the timeline."
-
-        # Format as text
-        result = "Last 5 Changes:\n\n"
-        for i, change in enumerate(changes, 1):
-            danger_flag = " ⚠️ DANGER" if change["danger"] else ""
-            result += f"{i}. [{change['classification'].upper()}] {change['file']}{danger_flag}\n"
-            result += f"   Time: {change['timestamp']}\n"
-            result += f"   Summary: {change['summary']}\n\n"
-
-        print(f"✅ MCP: Retrieved {len(changes)} last changes")
-
-        return result
-
-    except Exception as e:
-        print(f"❌ MCP: Error retrieving changes: {e}")
-        return f"Error retrieving changes: {str(e)}"
-
-
-# ============================================================================
-# Startup
-# ============================================================================
 
 @app.on_event("startup")
-async def startup_event():
-    """Run on application startup"""
-    print("\n🚀 DevLog AI API Starting...")
-    print(f"📁 Project Root: {PROJECT_ROOT}")
-    print(f"📝 Devlog Path: {DEVLOG_PATH.absolute()}")
-    print(f"🔥 Firestore: {'✅ Enabled' if FIRESTORE_AVAILABLE else '❌ Disabled (local-only mode)'}")
-
-    # Ensure devlog exists
-    ensure_devlog_exists()
-
-    print("✅ API Ready!\n")
+async def startup_event() -> None:
+    ensure_paths()
+    probe_firestore_access()
+    print("[DevLog API] Startup complete.")
+    print(f"[DevLog API] Project root: {PROJECT_ROOT}")
+    print(f"[DevLog API] Devlog path: {DEVLOG_PATH}")
+    print(
+        f"[DevLog API] Firestore={'enabled' if FIRESTORE_AVAILABLE else 'disabled'} "
+        f"Vertex={'enabled' if brain.available else 'disabled'}"
+    )
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    print("Starting DevLog AI API server...")
-    print("📍 http://localhost:8000")
-    print("📚 Docs: http://localhost:8000/docs")
-    print("🔧 ReDoc: http://localhost:8000/redoc\n")
-
     uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
+        "api.main:app",
+        host=settings.host,
+        port=settings.port,
         reload=True,
-        log_level="info"
+        log_level="info",
     )

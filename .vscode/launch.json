@@ -2,18 +2,24 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Run DevLog Backend",
+      "name": "Run DevLog Local API",
       "type": "python",
       "request": "launch",
+      "python": "C:\\Users\\natan\\AppData\\Local\\Programs\\Python\\Python313\\python.exe",
       "module": "uvicorn",
       "args": [
-        "server.app.main:app",
+        "api.main:app",
         "--host",
         "127.0.0.1",
         "--port",
-        "8000"
+        "8000",
+        "--reload"
       ],
       "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/api/.env",
+      "env": {
+        "DEVLOG_PROJECT_ROOT": "${workspaceFolder}"
+      },
       "console": "integratedTerminal",
       "justMyCode": false
     },
@@ -29,9 +35,9 @@
   ],
   "compounds": [
     {
-      "name": "Run DevLog Backend + Extension",
+      "name": "Run DevLog API + Extension",
       "configurations": [
-        "Run DevLog Backend",
+        "Run DevLog Local API",
         "Run DevLog Extension"
       ]
     }

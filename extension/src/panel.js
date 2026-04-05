@@ -1,40 +1,49 @@
 const vscode = require('vscode')
 
+const { getBaseUrl, getProjectId } = require('./config')
+
 class DevLogPanel {
   constructor(extensionUri) {
     this.extensionUri = extensionUri
     this._panel = undefined
-  }
-
-  open() {
-    if (this._panel) { this._panel.reveal(vscode.ViewColumn.One); return }
-    this._panel = vscode.window.createWebviewPanel(
-      'devlogMain', 'DevLog — Project Explorer', vscode.ViewColumn.One,
-      { enableScripts: true, retainContextWhenHidden: true }
-    )
-    this._panel.onDidDispose(() => { this._panel = undefined })
-    this._panel.webview.onDidReceiveMessage(msg => this._onMessage(msg))
-    this._panel.webview.html = buildHomeHtml()
-  }
-
-  async _onMessage(msg) {
-    switch (msg.type) {
-      case 'generateDiagram':
-        await this._generate('/diagram', { kind: msg.kind, projectId: getProjectId(), filePath: getActiveFile() }, msg.kind + ' diagram')
-        break
-      case 'explainFiles':
-        await this._generate('/architecture/map', { projectId: getProjectId() }, 'files breakdown')
-        break
-      case 'explainFile':
-        await this._generate('/explain/file', { projectId: getProjectId(), filePath: msg.filePath }, 'file explanation')
-        break
-      case 'query':
-        await this._query(msg.text)
-        break
+    this._ready = false
+    this._config = {
+      elevenLabsApiKey: '',
+      elevenLabsVoiceId: '21m00Tcm4TlvDq8ikWAM',
     }
   }
 
-  async _generate(endpoint, body, label) {
+  open() {
+    if (this._panel) {
+      this._panel.reveal(vscode.ViewColumn.One)
+      this._flushConfig()
+      return
+    }
+
+    this._ready = false
+    this._panel = vscode.window.createWebviewPanel(
+      'devlogMain',
+      'DevLog Project Explorer',
+      vscode.ViewColumn.One,
+      { enableScripts: true, retainContextWhenHidden: true },
+    )
+    this._panel.onDidDispose(() => {
+      this._panel = undefined
+      this._ready = false
+    })
+    this._panel.webview.onDidReceiveMessage(msg => void this._onMessage(msg))
+    this._panel.webview.html = buildHomeHtml(this._panel.webview)
+  }
+
+  setConfig(config) {
+    this._config = {
+      ...this._config,
+      ...config,
+    }
+    this._flushConfig()
+  }
+
+  async generate(endpoint, body, label) {
     this._send({ type: 'loading', label })
     try {
       const data = await postJson(endpoint, body)
@@ -44,554 +53,423 @@ class DevLogPanel {
     }
   }
 
-  async _query(text) {
-    this._send({ type: 'loading', label: 'answer' })
+  async query(text) {
+    const trimmed = String(text || '').trim()
+    if (!trimmed) return
+    this._send({ type: 'queryLoading' })
     try {
-      const data = await postJson('/query', { projectId: getProjectId(), query: text })
-      this._send({ type: 'queryResult', answer: data.answer || data.response || JSON.stringify(data) })
+      const data = await postJson('/query', { projectId: getProjectId(), question: trimmed, query: trimmed })
+      this._send({ type: 'queryResult', answer: data.answer || '' })
     } catch (err) {
-      this._send({ type: 'error', label: 'answer', message: err.message })
+      this._send({ type: 'queryError', message: err.message })
     }
   }
 
-  _send(msg) { this._panel?.webview.postMessage(msg) }
+  async _onMessage(msg) {
+    if (msg.type === 'ready') {
+      this._ready = true
+      this._flushConfig()
+      return
+    }
+    if (msg.type === 'generateDiagram') {
+      const label = `${msg.kind} diagram`
+      await this.generate('/diagram', { kind: msg.kind, projectId: getProjectId(), filePath: getActiveFile() }, label)
+      return
+    }
+    if (msg.type === 'architectureMap') {
+      await this.generate('/architecture/map', { projectId: getProjectId() }, 'Architecture map')
+      return
+    }
+    if (msg.type === 'explainFile') {
+      await this.generate('/explain/file', { projectId: getProjectId(), filePath: msg.filePath }, `Explain ${msg.filePath}`)
+      return
+    }
+    if (msg.type === 'searchCode') {
+      await this.generate('/search/code', { projectId: getProjectId(), query: msg.query, limit: 8 }, `Search: ${msg.query}`)
+      return
+    }
+    if (msg.type === 'query') {
+      await this.query(msg.text)
+    }
+  }
+
+  _flushConfig() {
+    if (!this._panel || !this._ready) return
+    this._send({ type: 'configure', ...this._config })
+  }
+
+  _send(message) {
+    this._panel?.webview.postMessage(message)
+  }
 }
 
-function getProjectId() {
-  return vscode.workspace.getConfiguration('devlog').get('projectId', 'default')
-}
 function getActiveFile() {
   const editor = vscode.window.activeTextEditor
   if (!editor) return undefined
   return vscode.workspace.asRelativePath(editor.document.uri, false).replace(/\\/g, '/')
 }
+
 async function postJson(path, body) {
-  const baseUrl = vscode.workspace.getConfiguration('devlog').get('apiBaseUrl', 'http://127.0.0.1:8000')
-  const res = await fetch(`${baseUrl}${path}`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  const response = await fetch(`${getBaseUrl().replace(/\/$/, '')}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
   })
-  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`)
-  return res.json()
+  if (!response.ok) {
+    throw new Error(`${response.status} ${await response.text()}`)
+  }
+  return response.json()
 }
 
-function buildHomeHtml() {
+function buildHomeHtml(webview) {
   const nonce = String(Date.now())
+  const cspSource = webview.cspSource
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8"/>
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}' https://cdn.jsdelivr.net; connect-src https://api.elevenlabs.io; media-src blob:;">
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src ${cspSource} https: data:; script-src 'nonce-${nonce}' https://cdn.jsdelivr.net; connect-src ${cspSource} http://127.0.0.1:8000 http://localhost:8000 https://api.elevenlabs.io; media-src blob: https:;" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    *{box-sizing:border-box;margin:0;padding:0}
-    body{font-family:var(--vscode-font-family);background:var(--vscode-editor-background);color:var(--vscode-foreground);padding:24px;display:grid;gap:20px}
-    h1{font-size:20px;font-weight:600;margin-bottom:4px}
-    h2{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--vscode-descriptionForeground);margin-bottom:12px}
-    .card{border:1px solid var(--vscode-panel-border);border-radius:12px;padding:16px}
-    .diagram-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:8px}
-    .diagram-btn{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);border:1px solid var(--vscode-panel-border);border-radius:8px;padding:10px 6px;cursor:pointer;font-size:12px;text-align:center;transition:background .15s}
-    .diagram-btn:hover{background:var(--vscode-button-background);color:var(--vscode-button-foreground)}
-    .diagram-btn .icon{font-size:20px;display:block;margin-bottom:5px}
-    .primary-btn{background:var(--vscode-button-background);color:var(--vscode-button-foreground);border:none;border-radius:8px;padding:8px 16px;cursor:pointer;font-size:13px}
-    .primary-btn:hover{opacity:.9}
-    /* voice toggle */
-    .voice-bar{display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--vscode-textBlockQuote-background);border-radius:10px;border:1px solid var(--vscode-panel-border)}
-    .voice-toggle{position:relative;width:40px;height:22px;flex-shrink:0}
-    .voice-toggle input{opacity:0;width:0;height:0}
-    .voice-slider{position:absolute;inset:0;background:var(--vscode-input-border);border-radius:22px;cursor:pointer;transition:.2s}
-    .voice-slider:before{content:'';position:absolute;width:16px;height:16px;left:3px;top:3px;background:white;border-radius:50%;transition:.2s}
-    input:checked + .voice-slider{background:var(--vscode-button-background)}
-    input:checked + .voice-slider:before{transform:translateX(18px)}
-    .voice-info{flex:1;font-size:12px}
-    .voice-info strong{display:block;font-size:13px}
-    .voice-info span{color:var(--vscode-descriptionForeground);font-size:11px}
-    .mic-indicator{width:10px;height:10px;border-radius:50%;background:var(--vscode-input-border);flex-shrink:0;transition:background .3s}
-    .mic-indicator.listening{background:#f44;box-shadow:0 0 6px #f44;animation:pulse 1s infinite}
-    .mic-indicator.heard{background:#4caf50}
-    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-    .voice-status{font-size:11px;color:var(--vscode-descriptionForeground);min-height:16px}
-    /* output */
-    #output{display:none}
-    .output-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
-    .back-btn{background:none;border:none;color:var(--vscode-textLink-foreground);cursor:pointer;font-size:12px}
-    .mermaid-wrap{overflow:auto;background:var(--vscode-editor-background);border-radius:8px;padding:12px}
-    .explanation{white-space:pre-wrap;font-size:13px;line-height:1.6;margin-top:12px}
-    .file-list{display:grid;gap:8px}
-    .file-item{border:1px solid var(--vscode-panel-border);border-radius:8px;padding:10px 14px;cursor:pointer}
-    .file-item:hover{background:var(--vscode-list-hoverBackground)}
-    .file-path{font-family:var(--vscode-editor-font-family);font-size:12px;color:var(--vscode-textLink-foreground)}
-    .file-desc{font-size:12px;color:var(--vscode-descriptionForeground);margin-top:3px}
-    .spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--vscode-panel-border);border-top-color:var(--vscode-button-background);border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:8px}
-    @keyframes spin{to{transform:rotate(360deg)}}
-    .loading-msg{color:var(--vscode-descriptionForeground);font-size:13px;padding:24px 0}
-    .error-msg{color:var(--vscode-list-errorForeground);font-size:13px;padding:12px}
-    /* ask */
-    .query-row{display:flex;gap:8px}
-    .query-input{flex:1;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border);border-radius:8px;padding:8px 12px;font-size:13px}
-    .query-input::placeholder{color:var(--vscode-input-placeholderForeground)}
-    .answer-box{margin-top:12px;padding:12px;background:var(--vscode-textBlockQuote-background);border-left:3px solid var(--vscode-button-background);border-radius:4px;font-size:13px;line-height:1.6;white-space:pre-wrap;display:none}
-    /* tts bar */
-    .tts-bar{display:none;align-items:center;gap:8px;margin-top:14px;padding:8px 12px;background:var(--vscode-textBlockQuote-background);border-radius:8px;border:1px solid var(--vscode-panel-border)}
-    .tts-bar.visible{display:flex}
-    .tts-btn{background:var(--vscode-button-background);color:var(--vscode-button-foreground);border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px}
-    .tts-btn.sec{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)}
-    .tts-speed{background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border);border-radius:4px;padding:3px 6px;font-size:11px;width:68px}
-    .tts-label{font-size:11px;color:var(--vscode-descriptionForeground);flex:1}
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 24px; font-family: var(--vscode-font-family); color: var(--vscode-foreground); background: var(--vscode-editor-background); display: grid; gap: 18px; }
+    h1 { margin: 0; font-size: 22px; }
+    h2 { margin: 0 0 10px; font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--vscode-descriptionForeground); }
+    p { margin: 0; line-height: 1.5; }
+    .card { border: 1px solid var(--vscode-panel-border); border-radius: 12px; padding: 16px; display: grid; gap: 12px; }
+    .grid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
+    button { border: 1px solid var(--vscode-panel-border); border-radius: 8px; background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); padding: 10px 12px; cursor: pointer; text-align: left; }
+    button.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border-color: transparent; }
+    button:hover { filter: brightness(1.05); }
+    .query-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; }
+    input { width: 100%; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: 8px; padding: 9px 12px; }
+    #answer-box { display: none; white-space: pre-wrap; border-left: 3px solid var(--vscode-button-background); background: var(--vscode-textBlockQuote-background); border-radius: 6px; padding: 12px; line-height: 1.6; }
+    #output { display: none; gap: 16px; }
+    .output-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+    .muted { color: var(--vscode-descriptionForeground); font-size: 12px; }
+    .mermaid-wrap { overflow: auto; border: 1px solid var(--vscode-panel-border); border-radius: 10px; padding: 12px; background: var(--vscode-editor-background); }
+    .section { display: grid; gap: 10px; }
+    .list { display: grid; gap: 8px; }
+    .item { border: 1px solid var(--vscode-panel-border); border-radius: 10px; padding: 10px 12px; cursor: pointer; }
+    .item:hover { background: var(--vscode-list-hoverBackground); }
+    .file { color: var(--vscode-textLink-foreground); font-size: 12px; font-family: var(--vscode-editor-font-family); }
+    .summary { color: var(--vscode-descriptionForeground); font-size: 12px; }
+    .refs { display: flex; flex-wrap: wrap; gap: 8px; }
+    .refs code { font-size: 12px; }
+    .controls { display: flex; gap: 8px; align-items: center; }
+    .hidden { display: none !important; }
+    .loading { color: var(--vscode-descriptionForeground); }
+    ul { margin: 0; padding-left: 18px; line-height: 1.6; }
   </style>
 </head>
 <body>
+  <div id="home" class="section">
+    <div>
+      <h1>DevLog Project Explorer</h1>
+      <p class="muted">Grounded diagrams, file explanations, and project answers from the local Vertex + Firebase stack.</p>
+    </div>
 
-<audio id="el-audio" style="display:none"></audio>
-
-<!-- HOME -->
-<div id="home">
-  <div>
-    <h1>DevLog Project Explorer</h1>
-    <p style="color:var(--vscode-descriptionForeground);font-size:13px;margin-top:4px">Understand any codebase — diagrams, file breakdowns, and natural language answers.</p>
-  </div>
-
-  <!-- Voice assistant toggle -->
-  <div class="voice-bar">
-    <div style="display:flex;flex-direction:column;gap:4px;flex:1">
-      <div style="display:flex;align-items:center;gap:10px">
-        <label class="voice-toggle">
-          <input type="checkbox" id="voice-toggle"/>
-          <span class="voice-slider"></span>
-        </label>
-        <div class="voice-info">
-          <strong>🎙️ Voice Assistant</strong>
-          <span>Say "Hey DevLog" then ask your question</span>
-        </div>
-        <div class="mic-indicator" id="mic-dot"></div>
+    <div class="card">
+      <h2>Diagrams</h2>
+      <div class="grid">
+        <button data-action="architecture" class="primary">Architecture map</button>
+        <button data-kind="dependency">Dependency diagram</button>
+        <button data-kind="flow">Flow diagram</button>
+        <button data-kind="class">Class diagram</button>
+        <button data-kind="sequence">Sequence diagram</button>
       </div>
-      <div class="voice-status" id="voice-status">Voice off</div>
+    </div>
+
+    <div class="card">
+      <h2>Code Search</h2>
+      <div class="query-row">
+        <input id="search-input" placeholder="Search for a file, symbol, or keyword" />
+        <button id="search-btn" class="primary">Search</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Ask Anything</h2>
+      <div class="query-row">
+        <input id="query-input" placeholder="How does auth work? What changed most recently?" />
+        <button id="ask-btn" class="primary">Ask</button>
+      </div>
+      <div id="answer-box"></div>
+      <div class="controls">
+        <button id="play-answer">Play answer</button>
+        <button id="stop-audio">Stop audio</button>
+      </div>
     </div>
   </div>
 
-  <!-- Diagrams -->
-  <div class="card">
-    <h2>Diagrams</h2>
-    <div class="diagram-grid">
-      <button class="diagram-btn" data-kind="architecture"><span class="icon">🏗️</span>Architecture</button>
-      <button class="diagram-btn" data-kind="dependency"><span class="icon">🔗</span>Dependencies</button>
-      <button class="diagram-btn" data-kind="flow"><span class="icon">🔀</span>Flow Chart</button>
-      <button class="diagram-btn" data-kind="class"><span class="icon">🧱</span>Class / UML</button>
-      <button class="diagram-btn" data-kind="sequence"><span class="icon">📨</span>Sequence</button>
-      <button class="diagram-btn" data-kind="database"><span class="icon">🗄️</span>Database / ERD</button>
-      <button class="diagram-btn" data-kind="api"><span class="icon">🌐</span>API Routes</button>
-      <button class="diagram-btn" data-kind="component"><span class="icon">🧩</span>Components</button>
+  <div id="output" class="section">
+    <div class="output-header">
+      <div>
+        <div id="output-title" style="font-size:16px;font-weight:600;"></div>
+        <div id="output-subtitle" class="muted"></div>
+      </div>
+      <button id="back-btn">Back</button>
     </div>
-  </div>
-
-  <!-- Files breakdown -->
-  <div class="card">
-    <h2>Files Breakdown</h2>
-    <p style="font-size:13px;color:var(--vscode-descriptionForeground);margin-bottom:12px">Plain-English explanation of every file and folder.</p>
-    <button class="primary-btn" id="explain-files-btn">Explain All Files</button>
-  </div>
-
-  <!-- Ask anything -->
-  <div class="card">
-    <h2>Ask Anything</h2>
-    <div class="query-row">
-      <input class="query-input" id="query-input" placeholder="e.g. How does auth work? What does service.py do?"/>
-      <button class="primary-btn" id="ask-btn">Ask</button>
+    <div class="controls">
+      <button id="play-result">Play result</button>
+      <button id="stop-result">Stop audio</button>
     </div>
-    <div class="answer-box" id="answer-box"></div>
+    <div id="output-body"></div>
   </div>
-</div>
 
-<!-- OUTPUT VIEW -->
-<div id="output">
-  <div class="output-header">
-    <span id="output-title" style="font-size:15px;font-weight:600"></span>
-    <button class="back-btn" id="back-btn">← Back</button>
-  </div>
-  <div id="output-body"></div>
-  <div class="tts-bar" id="tts-bar">
-    <span class="tts-label">🔊 Read aloud</span>
-    <select class="tts-speed" id="tts-speed">
-      <option value="0.75">0.75×</option>
-      <option value="1" selected>1×</option>
-      <option value="1.25">1.25×</option>
-      <option value="1.5">1.5×</option>
-    </select>
-    <button class="tts-btn" id="tts-play">▶ Play</button>
-    <button class="tts-btn sec" id="tts-stop" style="display:none">■ Stop</button>
-  </div>
-</div>
+  <audio id="el-audio"></audio>
+  <script nonce="${nonce}" src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script nonce="${nonce}">
+    const vscode = acquireVsCodeApi()
+    const audio = document.getElementById('el-audio')
+    let elevenLabsApiKey = ''
+    let elevenLabsVoiceId = '21m00Tcm4TlvDq8ikWAM'
+    let lastAnswerText = ''
+    let lastResultText = ''
 
-<script nonce="${nonce}" src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
-<script nonce="${nonce}">
-  const vscode = acquireVsCodeApi()
-  mermaid.initialize({ startOnLoad: false, securityLevel: 'loose', theme: 'neutral' })
-
-  // ── ElevenLabs config (populated via configure message from extension host) ──
-  let elevenLabsApiKey  = ''
-  let elevenLabsVoiceId = '21m00Tcm4TlvDq8ikWAM'
-  let elAudioPlaying    = false
-
-  // ── Persist state across panel hides ─────────────────────────────
-  const saved = vscode.getState() || {}
-  let autoSpeak = saved.autoSpeak || false
-  let ttsSpeed  = saved.ttsSpeed  || 1
-  let _ttsText  = ''
-
-  function saveState() {
-    vscode.setState({ autoSpeak, ttsSpeed })
-  }
-
-  // Restore toggle + speed on load
-  document.getElementById('voice-toggle').checked = autoSpeak  // reuse toggle for autoSpeak? No — separate
-  document.getElementById('tts-speed').value = ttsSpeed
-
-  // ── Auto-speak toggle (on home page, separate from voice) ─────────
-  // We'll add it inline next to the voice bar — actually wire voice-toggle
-  // to BOTH voice recognition AND auto-speak so one toggle does both.
-
-  // ── Voice Recognition ─────────────────────────────────────────────
-  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
-  let recognition = null
-  let voiceOn = false
-  let awaitingQuestion = false
-
-  const micDot    = document.getElementById('mic-dot')
-  const voiceStat = document.getElementById('voice-status')
-  const toggle    = document.getElementById('voice-toggle')
-
-  // Restore toggle state
-  toggle.checked = saved.voiceOn || false
-  if (toggle.checked) startVoice()
-
-  toggle.addEventListener('change', () => {
-    if (toggle.checked) {
-      startVoice()
-      autoSpeak = true
-    } else {
-      stopVoice()
-      autoSpeak = false
-    }
-    saveState()
-  })
-
-  function startVoice() {
-    if (!SpeechRecognition) {
-      voiceStat.textContent = '⚠️ Speech recognition not supported in this browser'
-      toggle.checked = false
-      return
-    }
-    voiceOn = true
-    voiceStat.textContent = '👂 Listening for "Hey DevLog"…'
-    micDot.className = 'mic-indicator listening'
-    listenForWakeWord()
-  }
-
-  function stopVoice() {
-    voiceOn = false
-    awaitingQuestion = false
-    recognition?.abort()
-    recognition = null
-    micDot.className = 'mic-indicator'
-    voiceStat.textContent = 'Voice off'
-  }
-
-  function listenForWakeWord() {
-    if (!voiceOn) return
-    recognition = new SpeechRecognition()
-    recognition.continuous = false
-    recognition.interimResults = false
-    recognition.lang = 'en-US'
-
-    recognition.onresult = (e) => {
-      const transcript = e.results[0][0].transcript.trim().toLowerCase()
-      voiceStat.textContent = '🎙️ Heard: "' + transcript + '"'
-
-      if (awaitingQuestion) {
-        // Strip wake word if they repeated it
-        const clean = transcript.replace(/^hey\s+devlog[,.]?\s*/i, '').trim()
-        if (clean) {
-          awaitingQuestion = false
-          micDot.className = 'mic-indicator heard'
-          voiceStat.textContent = '💬 "' + clean + '"'
-          submitVoiceQuery(clean)
-        } else {
-          awaitingQuestion = false
-          listenForWakeWord()
-        }
-        return
-      }
-
-      if (transcript.includes('hey devlog')) {
-        // Wake word detected — now listen for the question
-        awaitingQuestion = true
-        micDot.className = 'mic-indicator heard'
-        voiceStat.textContent = '✅ Hey DevLog! What\'s your question?'
-        speak('Yes?')
-        setTimeout(() => listenForQuestion(), 800)
-      } else {
-        listenForWakeWord()
-      }
+    if (window.mermaid) {
+      mermaid.initialize({ startOnLoad: false, securityLevel: 'loose', theme: 'neutral' })
     }
 
-    recognition.onerror = (e) => {
-      if (e.error === 'no-speech' || e.error === 'aborted') {
-        if (voiceOn) listenForWakeWord()
-        return
-      }
-      voiceStat.textContent = '⚠️ Mic error: ' + e.error
-    }
-
-    recognition.onend = () => {
-      if (voiceOn && !awaitingQuestion) listenForWakeWord()
-    }
-
-    recognition.start()
-  }
-
-  function listenForQuestion() {
-    if (!voiceOn) return
-    recognition = new SpeechRecognition()
-    recognition.continuous = false
-    recognition.interimResults = false
-    recognition.lang = 'en-US'
-    micDot.className = 'mic-indicator listening'
-    voiceStat.textContent = '🎙️ Listening for your question…'
-
-    recognition.onresult = (e) => {
-      const question = e.results[0][0].transcript.trim().replace(/^hey\s+devlog[,.]?\s*/i, '')
-      awaitingQuestion = false
-      micDot.className = 'mic-indicator heard'
-      voiceStat.textContent = '💬 "' + question + '"'
-      submitVoiceQuery(question)
-    }
-
-    recognition.onerror = (e) => {
-      awaitingQuestion = false
-      voiceStat.textContent = e.error === 'no-speech' ? '🤔 Didn\'t catch that, try again' : '⚠️ ' + e.error
-      if (voiceOn) setTimeout(listenForWakeWord, 1500)
-    }
-
-    recognition.onend = () => {
-      if (voiceOn && awaitingQuestion) listenForQuestion()
-    }
-
-    recognition.start()
-  }
-
-  function submitVoiceQuery(text) {
-    // Fill the input so user can see what was heard
-    document.getElementById('query-input').value = text
-    document.getElementById('answer-box').style.display = 'block'
-    document.getElementById('answer-box').textContent = '⏳ Thinking…'
-    vscode.postMessage({ type: 'query', text })
-    // Don't restart listening here — wait until audio finishes (see queryResult handler / el.onended)
-  }
-
-  // ── TTS helpers ───────────────────────────────────────────────────
-  async function speak(text, rate) {
-    if (!text) return
-    if (elevenLabsApiKey) {
-      try {
-        const res = await fetch(
-          `https://api.elevenlabs.io/v1/text-to-speech/${elevenLabsVoiceId}`,
-          {
-            method: 'POST',
-            headers: { 'xi-api-key': elevenLabsApiKey, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text, model_id: 'eleven_monolingual_v1' }),
-          }
-        )
-        if (!res.ok) throw new Error(`ElevenLabs ${res.status}`)
-        const blob = await res.blob()
-        const url  = URL.createObjectURL(blob)
-        const el   = document.getElementById('el-audio')
-        el.src = url
-        elAudioPlaying = true
-        el.onended = () => {
-          elAudioPlaying = false
-          URL.revokeObjectURL(url)
-          document.getElementById('tts-play').style.display = 'inline-block'
-          document.getElementById('tts-stop').style.display = 'none'
-          if (voiceOn) listenForWakeWord()
-        }
-        el.play()
-        document.getElementById('tts-play').style.display = 'none'
-        document.getElementById('tts-stop').style.display = 'inline-block'
-        return
-      } catch (err) {
-        console.warn('ElevenLabs TTS failed, falling back:', err.message)
-      }
-    }
-    // SpeechSynthesis fallback
-    speechSynthesis.cancel()
-    const utt = new SpeechSynthesisUtterance(text)
-    utt.rate = rate || parseFloat(document.getElementById('tts-speed').value)
-    utt.onend = () => {
-      document.getElementById('tts-play').style.display = 'inline-block'
-      document.getElementById('tts-stop').style.display = 'none'
-    }
-    speechSynthesis.speak(utt)
-    document.getElementById('tts-play').style.display = 'none'
-    document.getElementById('tts-stop').style.display = 'inline-block'
-  }
-
-  function setTtsText(text) {
-    _ttsText = text
-    speechSynthesis.cancel()
-    document.getElementById('tts-bar').classList.toggle('visible', !!text.trim())
-    document.getElementById('tts-play').style.display = 'inline-block'
-    document.getElementById('tts-stop').style.display = 'none'
-    if (autoSpeak && text.trim()) speak(text)
-  }
-
-  document.getElementById('tts-play').addEventListener('click', () => speak(_ttsText))
-  document.getElementById('tts-stop').addEventListener('click', () => {
-    speechSynthesis.cancel()
-    const el = document.getElementById('el-audio')
-    el.pause(); el.src = ''
-    elAudioPlaying = false
-    document.getElementById('tts-play').style.display = 'inline-block'
-    document.getElementById('tts-stop').style.display = 'none'
-  })
-  document.getElementById('tts-speed').addEventListener('change', (e) => {
-    ttsSpeed = parseFloat(e.target.value)
-    saveState()
-  })
-
-  // ── Navigation ────────────────────────────────────────────────────
-  document.getElementById('back-btn').addEventListener('click', () => {
-    speechSynthesis.cancel()
-    document.getElementById('home').style.display = 'grid'
-    document.getElementById('output').style.display = 'none'
-  })
-
-  function showLoading(label) {
-    document.getElementById('home').style.display = 'none'
-    document.getElementById('output').style.display = 'block'
-    document.getElementById('tts-bar').classList.remove('visible')
-    document.getElementById('output-title').textContent = label
-    document.getElementById('output-body').innerHTML = '<div class="loading-msg"><span class="spinner"></span>Generating ' + esc(label) + '…</div>'
-  }
-
-  // ── Diagram + file buttons ────────────────────────────────────────
-  document.querySelectorAll('.diagram-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      showLoading(btn.textContent.trim() + ' diagram')
-      vscode.postMessage({ type: 'generateDiagram', kind: btn.dataset.kind })
+    document.querySelectorAll('[data-kind]').forEach(button => {
+      button.addEventListener('click', () => {
+        showLoading(button.dataset.kind + ' diagram')
+        vscode.postMessage({ type: 'generateDiagram', kind: button.dataset.kind })
+      })
     })
-  })
+    document.querySelector('[data-action="architecture"]').addEventListener('click', () => {
+      showLoading('Architecture map')
+      vscode.postMessage({ type: 'architectureMap' })
+    })
+    document.getElementById('search-btn').addEventListener('click', () => sendSearch())
+    document.getElementById('search-input').addEventListener('keydown', event => {
+      if (event.key === 'Enter') sendSearch()
+    })
+    document.getElementById('ask-btn').addEventListener('click', () => sendQuery())
+    document.getElementById('query-input').addEventListener('keydown', event => {
+      if (event.key === 'Enter') sendQuery()
+    })
+    document.getElementById('back-btn').addEventListener('click', () => {
+      stopAudio()
+      document.getElementById('home').style.display = 'grid'
+      document.getElementById('output').style.display = 'none'
+    })
+    document.getElementById('play-answer').addEventListener('click', () => speak(lastAnswerText))
+    document.getElementById('stop-audio').addEventListener('click', stopAudio)
+    document.getElementById('play-result').addEventListener('click', () => speak(lastResultText))
+    document.getElementById('stop-result').addEventListener('click', stopAudio)
 
-  document.getElementById('explain-files-btn').addEventListener('click', () => {
-    showLoading('Files breakdown')
-    vscode.postMessage({ type: 'explainFiles' })
-  })
+    function sendSearch() {
+      const query = document.getElementById('search-input').value.trim()
+      if (!query) return
+      showLoading('Search: ' + query)
+      vscode.postMessage({ type: 'searchCode', query })
+    }
 
-  // ── Ask anything ──────────────────────────────────────────────────
-  document.getElementById('ask-btn').addEventListener('click', sendQuery)
-  document.getElementById('query-input').addEventListener('keydown', e => { if (e.key === 'Enter') sendQuery() })
-  function sendQuery() {
-    const text = document.getElementById('query-input').value.trim()
-    if (!text) return
-    document.getElementById('answer-box').style.display = 'block'
-    document.getElementById('answer-box').textContent = '⏳ Thinking…'
-    vscode.postMessage({ type: 'query', text })
-  }
-
-  // ── Messages from extension host ─────────────────────────────────
-  window.addEventListener('message', async e => {
-    const msg = e.data
-    if (msg.type === 'loading') {
-      showLoading(msg.label)
-    } else if (msg.type === 'error') {
-      document.getElementById('output-body').innerHTML =
-        '<div class="error-msg">⚠️ ' + esc(msg.message) + '<br><small>Make sure the DevLog backend is running.</small></div>'
-      if (autoSpeak) speak('Error: ' + msg.message)
-    } else if (msg.type === 'queryResult') {
+    function sendQuery() {
+      const text = document.getElementById('query-input').value.trim()
+      if (!text) return
       const box = document.getElementById('answer-box')
       box.style.display = 'block'
-      box.textContent = msg.answer
-      if (autoSpeak) {
-        speak(msg.answer)
-        // For SpeechSynthesis path (no ElevenLabs key), restart listen loop immediately
-        if (!elevenLabsApiKey && voiceOn) listenForWakeWord()
-        // For ElevenLabs path, el.onended inside speak() handles restarting the loop
-      } else if (voiceOn) {
-        micDot.className = 'mic-indicator listening'
-        voiceStat.textContent = '👂 Listening for "Hey DevLog"…'
-        listenForWakeWord()
+      box.textContent = 'Thinking...'
+      vscode.postMessage({ type: 'query', text })
+    }
+
+    function showLoading(label) {
+      document.getElementById('home').style.display = 'none'
+      document.getElementById('output').style.display = 'grid'
+      document.getElementById('output-title').textContent = label
+      document.getElementById('output-subtitle').textContent = 'Generating from the local DevLog API'
+      document.getElementById('output-body').innerHTML = '<div class="loading">Loading...</div>'
+      lastResultText = ''
+    }
+
+    function stopAudio() {
+      window.speechSynthesis.cancel()
+      audio.pause()
+      audio.src = ''
+    }
+
+    async function speak(text) {
+      const trimmed = String(text || '').trim()
+      if (!trimmed) return
+      stopAudio()
+      if (elevenLabsApiKey) {
+        try {
+          const response = await fetch('https://api.elevenlabs.io/v1/text-to-speech/' + elevenLabsVoiceId, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'xi-api-key': elevenLabsApiKey,
+            },
+            body: JSON.stringify({
+              text: trimmed,
+              model_id: 'eleven_multilingual_v2',
+            }),
+          })
+          if (!response.ok) throw new Error('ElevenLabs ' + response.status)
+          const blob = await response.blob()
+          audio.src = URL.createObjectURL(blob)
+          await audio.play()
+          return
+        } catch (err) {
+          console.warn('ElevenLabs fallback:', err.message)
+        }
       }
-    } else if (msg.type === 'configure') {
-      elevenLabsApiKey  = msg.elevenLabsApiKey  || ''
-      elevenLabsVoiceId = msg.elevenLabsVoiceId || '21m00Tcm4TlvDq8ikWAM'
-    } else if (msg.type === 'result') {
-      await renderResult(msg.label, msg.data)
-    }
-  })
-
-  // ── Render result ─────────────────────────────────────────────────
-  async function renderResult(label, data) {
-    document.getElementById('output-title').textContent = label
-    const body = document.getElementById('output-body')
-    let speakText = ''
-
-    if (data.mermaid) {
-      const id = 'mermaid-' + Date.now()
-      body.innerHTML =
-        '<div class="mermaid-wrap"><div id="' + id + '" class="mermaid">' + esc(data.mermaid) + '</div></div>' +
-        (data.summary || data.explanation ? '<p class="explanation">' + esc(data.summary || data.explanation) + '</p>' : '') +
-        renderBullets(data.bullets || data.body || []) +
-        renderRefs(data.references || data.entrypoints || [])
-      try { await mermaid.run({ querySelector: '#' + id }) }
-      catch { document.getElementById(id).textContent = data.mermaid }
-      speakText = [label, data.summary || data.explanation, ...(data.bullets || data.body || [])].filter(Boolean).join('. ')
-      setTtsText(speakText)
-      return
+      const utterance = new SpeechSynthesisUtterance(trimmed)
+      window.speechSynthesis.speak(utterance)
     }
 
-    if (data.files || data.fileTree) {
-      const files = data.files || data.fileTree || []
-      body.innerHTML = '<div class="file-list">' + files.map(f =>
-        '<div class="file-item" data-path="' + esc(f.path || f.filePath || f) + '">' +
-        '<div class="file-path">' + esc(f.path || f.filePath || f) + '</div>' +
-        (f.description || f.summary ? '<div class="file-desc">' + esc(f.description || f.summary) + '</div>' : '') +
-        '</div>'
-      ).join('') + '</div>'
-      body.querySelectorAll('.file-item').forEach(item => {
-        item.addEventListener('click', () => {
-          showLoading('Explaining ' + item.dataset.path)
-          vscode.postMessage({ type: 'explainFile', filePath: item.dataset.path })
+    async function renderResult(label, data) {
+      document.getElementById('home').style.display = 'none'
+      document.getElementById('output').style.display = 'grid'
+      document.getElementById('output-title').textContent = label
+      document.getElementById('output-subtitle').textContent = data.summary || data.explanation || ''
+      document.getElementById('output-body').innerHTML = ''
+
+      const body = document.getElementById('output-body')
+      const chunks = []
+      if (data.title) chunks.push(data.title)
+      if (data.summary) chunks.push(data.summary)
+      if (data.explanation) chunks.push(data.explanation)
+
+      if (data.mermaid) {
+        const wrap = document.createElement('div')
+        wrap.className = 'mermaid-wrap'
+        const graph = document.createElement('div')
+        graph.className = 'mermaid'
+        graph.textContent = data.mermaid
+        wrap.appendChild(graph)
+        body.appendChild(wrap)
+        if (window.mermaid) {
+          try {
+            await mermaid.run({ nodes: [graph] })
+          } catch {
+            graph.textContent = data.mermaid
+          }
+        }
+      }
+
+      if (Array.isArray(data.bullets) && data.bullets.length) {
+        const list = document.createElement('ul')
+        data.bullets.forEach(item => {
+          const li = document.createElement('li')
+          li.textContent = item
+          list.appendChild(li)
+          chunks.push(item)
         })
-      })
-      speakText = files.map(f => {
-        const name = f.path || f.filePath || f
-        const desc = f.description || f.summary || ''
-        return desc ? name + ': ' + desc : name
-      }).join('. ')
-      setTtsText(speakText)
-      return
+        body.appendChild(list)
+      }
+
+      if (Array.isArray(data.entrypoints) && data.entrypoints.length) {
+        body.appendChild(renderReferenceBlock('Entrypoints', data.entrypoints))
+        chunks.push('Entrypoints: ' + data.entrypoints.join(', '))
+      }
+
+      if (Array.isArray(data.hotspots) && data.hotspots.length) {
+        body.appendChild(renderReferenceBlock('Hotspots', data.hotspots))
+        chunks.push('Hotspots: ' + data.hotspots.join(', '))
+      }
+
+      if (Array.isArray(data.references) && data.references.length) {
+        body.appendChild(renderReferenceBlock('References', data.references.map(item => item.filePath || item)))
+      }
+
+      if (Array.isArray(data.matches) && data.matches.length) {
+        const list = document.createElement('div')
+        list.className = 'list'
+        data.matches.forEach(match => {
+          const item = document.createElement('div')
+          item.className = 'item'
+          item.dataset.path = match.filePath
+          item.innerHTML = '<div class="file">' + escapeHtml(match.filePath) + '</div>' +
+            '<div class="summary">' + escapeHtml(match.snippet || '') + '</div>'
+          item.addEventListener('click', () => {
+            showLoading('Explain ' + match.filePath)
+            vscode.postMessage({ type: 'explainFile', filePath: match.filePath })
+          })
+          list.appendChild(item)
+          chunks.push(match.filePath)
+        })
+        body.appendChild(list)
+      }
+
+      if (!body.childNodes.length) {
+        const pre = document.createElement('pre')
+        pre.textContent = JSON.stringify(data, null, 2)
+        body.appendChild(pre)
+      }
+
+      lastResultText = chunks.filter(Boolean).join('. ')
     }
 
-    body.innerHTML =
-      (data.title ? '<h2 style="margin-bottom:8px">' + esc(data.title) + '</h2>' : '') +
-      (data.summary || data.explanation ? '<p class="explanation">' + esc(data.summary || data.explanation) + '</p>' : '') +
-      renderBullets(data.bullets || data.body || []) +
-      renderRefs(data.references || []) +
-      '<pre style="margin-top:12px;font-size:12px;white-space:pre-wrap">' + esc(JSON.stringify(data, null, 2)) + '</pre>'
-    speakText = [data.title, data.summary || data.explanation, ...(data.bullets || data.body || [])].filter(Boolean).join('. ')
-    setTtsText(speakText)
-  }
+    function renderReferenceBlock(title, items) {
+      const section = document.createElement('div')
+      section.className = 'section'
+      const heading = document.createElement('div')
+      heading.className = 'muted'
+      heading.textContent = title
+      section.appendChild(heading)
+      const refs = document.createElement('div')
+      refs.className = 'refs'
+      items.forEach(item => {
+        const code = document.createElement('code')
+        code.textContent = typeof item === 'string' ? item : (item.filePath || '')
+        refs.appendChild(code)
+      })
+      section.appendChild(refs)
+      return section
+    }
 
-  function renderBullets(items) {
-    if (!items.length) return ''
-    return '<ul style="margin-top:12px;padding-left:18px;font-size:13px;line-height:1.7">' + items.map(i => '<li>' + esc(i) + '</li>').join('') + '</ul>'
-  }
-  function renderRefs(refs) {
-    if (!refs.length) return ''
-    return '<div style="margin-top:12px;font-size:12px;color:var(--vscode-descriptionForeground)">' + refs.map(r => '<code>' + esc(typeof r === 'string' ? r : r.filePath || '') + '</code>').join(' · ') + '</div>'
-  }
-  function esc(v) {
-    return String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')
-  }
-</script>
+    function escapeHtml(value) {
+      return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+    }
+
+    window.addEventListener('message', async event => {
+      const msg = event.data
+      if (msg.type === 'configure') {
+        elevenLabsApiKey = msg.elevenLabsApiKey || ''
+        elevenLabsVoiceId = msg.elevenLabsVoiceId || '21m00Tcm4TlvDq8ikWAM'
+        return
+      }
+      if (msg.type === 'loading') {
+        showLoading(msg.label)
+        return
+      }
+      if (msg.type === 'error') {
+        document.getElementById('output-body').innerHTML = '<div class="loading">' + escapeHtml(msg.message) + '</div>'
+        return
+      }
+      if (msg.type === 'queryLoading') {
+        const box = document.getElementById('answer-box')
+        box.style.display = 'block'
+        box.textContent = 'Thinking...'
+        return
+      }
+      if (msg.type === 'queryError') {
+        const box = document.getElementById('answer-box')
+        box.style.display = 'block'
+        box.textContent = msg.message
+        return
+      }
+      if (msg.type === 'queryResult') {
+        const box = document.getElementById('answer-box')
+        box.style.display = 'block'
+        box.textContent = msg.answer || 'No answer returned.'
+        lastAnswerText = msg.answer || ''
+        return
+      }
+      if (msg.type === 'result') {
+        await renderResult(msg.label, msg.data || {})
+      }
+    })
+
+    vscode.postMessage({ type: 'ready' })
+  </script>
 </body>
 </html>`
 }

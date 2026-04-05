@@ -1,0 +1,17 @@
+{
+  "projectId": "default",
+  "currentSummary": "DevLog has not processed any project events yet.",
+  "frontendStatus": "No frontend events recorded.",
+  "backendStatus": "No backend events recorded.",
+  "sharedStatus": "No shared events recorded.",
+  "infraStatus": "No infrastructure events recorded.",
+  "activeTodos": [],
+  "resolvedTodos": [],
+  "risks": [],
+  "lastCompleted": "No completed milestone yet.",
+  "pendingNote": null,
+  "markdown": "# DevLog AI\n\n## Project Overview\nDevLog has not processed any project events yet.\n\n## Current Working State\n- Frontend: No frontend events recorded.\n- Backend: No backend events recorded.\n- Shared: No shared events recorded.\n- Infra: No infrastructure events recorded.\n- Last completed: No completed milestone yet.\n- Pending note: None\n\n## Live TODO List\n- [ ] No active TODOs.\n\n## Resolved TODOs\n- [x] No resolved TODOs yet.\n\n## Danger Zones\n- No open risks.\n\n## Recent Timeline\n- No events yet.\n\n## Session Snapshots\n- No milestone snapshots yet.\n",
+  "updatedAt": "2026-04-05T08:39:05.524390+00:00",
+  "timeline": [],
+  "snapshots": []
+}

@@ -12,6 +12,7 @@ SOURCE_SUFFIXES = {".py", ".ts", ".tsx", ".js", ".jsx", ".json", ".md", ".css", 
 ARCHITECTURE_SUFFIXES = {".py", ".ts", ".tsx", ".js", ".jsx"}
 IGNORE_DIRS = {
     ".git",
+    ".tmp_extension_branch",
     ".venv",
     ".venv313",
     "__pycache__",

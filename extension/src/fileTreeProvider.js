@@ -20,7 +20,7 @@ class FileTreeProvider {
 
     const uris = await vscode.workspace.findFiles(
       '**/*',
-      '{**/node_modules/**,**/.git/**,**/dist/**,**/__pycache__/**,**/.venv/**}',
+      '{**/node_modules/**,**/.git/**,**/dist/**,**/__pycache__/**,**/.venv/**,**/.venv313/**,**/devlog/**,**/.tmp_extension_branch/**}',
       150,
     )
 
@@ -43,7 +43,7 @@ class FileTreeProvider {
 
   _makeItem(filePath, fileStatus) {
     const item = new vscode.TreeItem(filePath, vscode.TreeItemCollapsibleState.None)
-    item.resourceUri = vscode.Uri.file(filePath)
+    item.resourceUri = vscode.Uri.joinPath(vscode.workspace.workspaceFolders[0].uri, filePath)
     item._statusKey = fileStatus?.status || 'unknown'
 
     if (fileStatus?.status === 'danger') {
