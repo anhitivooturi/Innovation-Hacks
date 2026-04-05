@@ -1,0 +1,81 @@
+{
+  "name": "devlog-ai-vscode",
+  "displayName": "DevLog AI",
+  "description": "Live project health, file status, decisions, and AI queries — powered by DevLog AI.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "engines": { "vscode": "^1.95.0" },
+  "categories": ["Other"],
+  "icon": "media/devlog.svg",
+  "activationEvents": ["onStartupFinished"],
+  "main": "./src/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "DevLog AI",
+      "properties": {
+        "devlog.apiBaseUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8000",
+          "description": "Base URL for the DevLog API (update to Cloud Run URL after deploy)."
+        },
+        "devlog.projectId": {
+          "type": "string",
+          "default": "default",
+          "description": "Project identifier sent to the DevLog backend."
+        },
+        "devlog.showStatusBar": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the DevLog status bar item."
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "devlog",
+          "title": "DevLog",
+          "icon": "media/devlog.svg"
+        }
+      ]
+    },
+    "views": {
+      "devlog": [
+        {
+          "id": "devlogSidebar",
+          "name": "DevLog",
+          "type": "webview"
+        },
+        {
+          "id": "devlogFileTree",
+          "name": "File Status",
+          "type": "tree"
+        }
+      ]
+    },
+    "commands": [
+      { "command": "devlog.openPanel",              "title": "DevLog: Open Project Copilot" },
+      { "command": "devlog.explainCurrentFile",     "title": "DevLog: Explain Current File" },
+      { "command": "devlog.explainSelection",       "title": "DevLog: Explain Selection" },
+      { "command": "devlog.showDependencyDiagram",  "title": "DevLog: Show Dependency Diagram" },
+      { "command": "devlog.showFlowDiagram",        "title": "DevLog: Show Flow Diagram" },
+      { "command": "devlog.showClassDiagram",       "title": "DevLog: Show Class Diagram" },
+      { "command": "devlog.showArchitectureMap",    "title": "DevLog: Show Architecture Map" },
+      { "command": "devlog.searchCode",             "title": "DevLog: Search Code" },
+      { "command": "devlog.refreshPanel",           "title": "DevLog: Refresh Panel" },
+      { "command": "devlog.refreshFileTree",        "title": "DevLog: Refresh File Tree" }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "devlog.refreshFileTree",
+          "when": "view == devlogFileTree",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "lint": "node --check src/extension.js src/contextHarvester.js src/statusProvider.js src/fileTreeProvider.js src/sidebarProvider.js"
+  }
+}
