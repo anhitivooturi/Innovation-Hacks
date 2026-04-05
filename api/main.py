@@ -7,7 +7,7 @@ Syncs all data to Firestore for real-time updates.
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -336,10 +336,18 @@ async def root():
             "POST /snapshot": "Create a devlog snapshot",
             "GET /snapshots": "List all snapshots",
             "POST /restore/{snapshot_id}": "Restore from snapshot",
-            "POST /mcp/log_decision": "Log a decision from MCP server",
-            "GET /mcp/get_project_context/{project_id}": "Get project context for MCP",
+            "GET /mcp": "MCP server info (Model Context Protocol)",
+            "POST /mcp": "MCP JSON-RPC handler (tools/list, tools/call)",
+            "POST /mcp/log_decision": "Legacy REST endpoint for logging decisions",
+            "GET /mcp/get_project_context/{project_id}": "Legacy REST endpoint for project context",
             "GET /health": "Health check"
-        }
+        },
+        "mcp_tools": [
+            "log_decision",
+            "get_project_context",
+            "flag_danger_zone",
+            "get_last_changes"
+        ]
     }
 
 
@@ -710,6 +718,323 @@ async def health_check():
         "devlog_exists": DEVLOG_PATH.exists(),
         "firestore_available": FIRESTORE_AVAILABLE
     }
+
+
+# ============================================================================
+# MCP (Model Context Protocol) JSON-RPC Endpoints
+# ============================================================================
+
+class MCPRequest(BaseModel):
+    """MCP JSON-RPC request"""
+    jsonrpc: str = "2.0"
+    method: str
+    params: Optional[dict] = None
+    id: Optional[Union[str, int]] = None
+
+
+@app.get("/mcp")
+async def mcp_server_info():
+    """
+    MCP server info endpoint.
+    Returns server metadata for MCP clients.
+    """
+    return {
+        "name": "devlog",
+        "version": "1.0.0",
+        "description": "DevLog AI - project memory for AI coding tools",
+        "protocol_version": "2024-11-05"
+    }
+
+
+@app.post("/mcp")
+async def mcp_jsonrpc_handler(request: MCPRequest):
+    """
+    MCP JSON-RPC handler.
+    Handles tools/list and tools/call methods.
+    """
+    try:
+        print(f"🔌 MCP JSON-RPC: {request.method}")
+
+        # Handle initialize
+        if request.method == "initialize":
+            return {
+                "jsonrpc": "2.0",
+                "id": request.id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {
+                        "tools": {}
+                    },
+                    "serverInfo": {
+                        "name": "devlog",
+                        "version": "1.0.0"
+                    }
+                }
+            }
+
+        # Handle notifications/initialized
+        elif request.method == "notifications/initialized":
+            return {
+                "jsonrpc": "2.0",
+                "id": request.id,
+                "result": {
+                    "status": "ok"
+                }
+            }
+
+        # Handle tools/list
+        elif request.method == "tools/list":
+            return {
+                "jsonrpc": "2.0",
+                "id": request.id,
+                "result": {
+                    "tools": [
+                        {
+                            "name": "log_decision",
+                            "description": "Log a decision to the project devlog and Firestore",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "type": {
+                                        "type": "string",
+                                        "description": "Decision type (e.g., architecture, refactor, bugfix)"
+                                    },
+                                    "content": {
+                                        "type": "string",
+                                        "description": "Decision content and rationale"
+                                    },
+                                    "source": {
+                                        "type": "string",
+                                        "description": "Source tool (e.g., Claude Code, Cursor)"
+                                    }
+                                },
+                                "required": ["type", "content", "source"]
+                            }
+                        },
+                        {
+                            "name": "get_project_context",
+                            "description": "Get the full devlog content for project context",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "project_id": {
+                                        "type": "string",
+                                        "description": "Project identifier (default: current)"
+                                    }
+                                },
+                                "required": []
+                            }
+                        },
+                        {
+                            "name": "flag_danger_zone",
+                            "description": "Flag a file or area as dangerous requiring careful review",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "file": {
+                                        "type": "string",
+                                        "description": "File path to flag"
+                                    },
+                                    "reason": {
+                                        "type": "string",
+                                        "description": "Reason why this is dangerous"
+                                    }
+                                },
+                                "required": ["file", "reason"]
+                            }
+                        },
+                        {
+                            "name": "get_last_changes",
+                            "description": "Get the last 5 changes from the project timeline",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {},
+                                "required": []
+                            }
+                        }
+                    ]
+                }
+            }
+
+        # Handle tools/call
+        elif request.method == "tools/call":
+            if not request.params or "name" not in request.params:
+                raise HTTPException(status_code=400, detail="Missing tool name in params")
+
+            tool_name = request.params["name"]
+            tool_args = request.params.get("arguments", {})
+
+            # Execute the requested tool
+            if tool_name == "log_decision":
+                result = await _mcp_log_decision(tool_args)
+            elif tool_name == "get_project_context":
+                result = await _mcp_get_project_context(tool_args)
+            elif tool_name == "flag_danger_zone":
+                result = await _mcp_flag_danger_zone(tool_args)
+            elif tool_name == "get_last_changes":
+                result = await _mcp_get_last_changes(tool_args)
+            else:
+                raise HTTPException(status_code=404, detail=f"Tool not found: {tool_name}")
+
+            return {
+                "jsonrpc": "2.0",
+                "id": request.id,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": result
+                        }
+                    ]
+                }
+            }
+
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown method: {request.method}")
+
+    except Exception as e:
+        print(f"❌ MCP JSON-RPC error: {e}")
+        return {
+            "jsonrpc": "2.0",
+            "id": request.id,
+            "error": {
+                "code": -32603,
+                "message": str(e)
+            }
+        }
+
+
+# ============================================================================
+# MCP Tool Implementations
+# ============================================================================
+
+async def _mcp_log_decision(args: dict) -> str:
+    """MCP tool: log_decision"""
+    decision_type = args.get("type", "decision")
+    content = args.get("content", "")
+    source = args.get("source", "MCP Client")
+
+    if not content:
+        raise ValueError("Decision content is required")
+
+    timestamp = datetime.now().isoformat()
+    formatted_time = datetime.fromisoformat(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+
+    # Format decision entry
+    entry = f"""
+**{formatted_time}** — Decision: {decision_type}
+- Source: {source}
+- {content}
+
+"""
+
+    # Append to devlog
+    append_to_devlog(entry)
+
+    # Sync to Firestore decisions collection
+    decision_data = {
+        "type": decision_type,
+        "content": content,
+        "source": source,
+        "timestamp": timestamp,
+        "created_at": timestamp
+    }
+    add_to_firestore_collection("decisions", decision_data)
+
+    print(f"✅ MCP: Decision logged: {decision_type}")
+
+    return f"Decision logged successfully: {decision_type}\nSource: {source}\nContent: {content[:100]}..."
+
+
+async def _mcp_get_project_context(args: dict) -> str:
+    """MCP tool: get_project_context"""
+    project_id = args.get("project_id", "current")
+
+    content = read_devlog()
+
+    # Get last updated time
+    stat = DEVLOG_PATH.stat()
+    last_updated = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+
+    print(f"✅ MCP: Project context retrieved for: {project_id}")
+
+    return f"Project: {project_id}\nLast Updated: {last_updated}\n\n--- DevLog Content ---\n\n{content}"
+
+
+async def _mcp_flag_danger_zone(args: dict) -> str:
+    """MCP tool: flag_danger_zone"""
+    file = args.get("file", "")
+    reason = args.get("reason", "")
+
+    if not file or not reason:
+        raise ValueError("Both file and reason are required")
+
+    timestamp = datetime.now().isoformat()
+    formatted_time = datetime.fromisoformat(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+
+    # Format danger zone entry
+    entry = f"""
+**{formatted_time}** — ⚠️ DANGER ZONE FLAGGED
+- File: `{file}`
+- Reason: {reason}
+
+"""
+
+    # Append to devlog
+    append_to_devlog(entry)
+
+    # Add to danger_zones collection in Firestore
+    add_to_firestore_collection("danger_zones", {
+        "file": file,
+        "reason": reason,
+        "created_at": timestamp,
+        "resolved": False,
+        "flagged_by": "MCP Client"
+    })
+
+    print(f"✅ MCP: Danger zone flagged: {file}")
+
+    return f"Danger zone flagged successfully:\nFile: {file}\nReason: {reason}"
+
+
+async def _mcp_get_last_changes(args: dict) -> str:
+    """MCP tool: get_last_changes"""
+    if not FIRESTORE_AVAILABLE:
+        return "Firestore is not available. Cannot retrieve changes."
+
+    try:
+        # Query last 5 changes from Firestore
+        changes_ref = db.collection("changes").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(5)
+        changes = []
+
+        for doc in changes_ref.stream():
+            change = doc.to_dict()
+            changes.append({
+                "timestamp": change.get("timestamp", ""),
+                "file": change.get("file", ""),
+                "classification": change.get("classification", "unknown"),
+                "summary": change.get("summary", "No summary"),
+                "danger": change.get("danger", False)
+            })
+
+        if not changes:
+            return "No changes found in the timeline."
+
+        # Format as text
+        result = "Last 5 Changes:\n\n"
+        for i, change in enumerate(changes, 1):
+            danger_flag = " ⚠️ DANGER" if change["danger"] else ""
+            result += f"{i}. [{change['classification'].upper()}] {change['file']}{danger_flag}\n"
+            result += f"   Time: {change['timestamp']}\n"
+            result += f"   Summary: {change['summary']}\n\n"
+
+        print(f"✅ MCP: Retrieved {len(changes)} last changes")
+
+        return result
+
+    except Exception as e:
+        print(f"❌ MCP: Error retrieving changes: {e}")
+        return f"Error retrieving changes: {str(e)}"
 
 
 # ============================================================================

@@ -37,6 +37,7 @@ export async function generateHandoffRequest() {
 
   return {
     content:
+      payload.handoff_document ??
       payload.content ??
       payload.handoff ??
       'The backend responded, but no handoff content field was found.',
@@ -44,5 +45,5 @@ export async function generateHandoffRequest() {
 }
 
 export async function restoreSnapshotRequest(snapshotId) {
-  return postJson('/restore', { snapshotId });
+  return postJson(`/restore/${snapshotId}`, {});
 }

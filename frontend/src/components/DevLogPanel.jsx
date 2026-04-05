@@ -7,24 +7,32 @@ import {
   splitMarkdownSections,
 } from '../lib/formatters';
 
-const SECTION_ORDER = ['Overview', 'Frontend', 'Backend', 'Todos'];
+const SECTION_ORDER = ['Recent Changes', 'Current State', 'Needs Building', 'Completed'];
+
+// Map friendly tab labels to actual markdown heading text
+const SECTION_MAPPING = {
+  'Recent Changes': 'Recent Changes',
+  'Current State': 'Current Working State',
+  'Needs Building': 'What Needs To Be Built',
+  'Completed': 'Completed',
+};
 
 export function DevLogPanel({ devlog, todos }) {
   const sections = useMemo(
     () => splitMarkdownSections(devlog?.content ?? ''),
     [devlog?.content],
   );
-  const [activeTab, setActiveTab] = useState(
-    SECTION_ORDER.find((label) => sections[label]) ?? 'Overview',
-  );
+  const [activeTab, setActiveTab] = useState('Recent Changes');
 
   const displayMarkdown = useMemo(() => {
-    if (activeTab === 'Todos') {
-      return sections.Todos ?? '## Todos\nWaiting for the backend to publish open work.';
+    const sectionKey = SECTION_MAPPING[activeTab];
+
+    if (sections[sectionKey]) {
+      return sections[sectionKey];
     }
 
-    return sections[activeTab] ?? devlog?.content ?? 'No project markdown yet.';
-  }, [activeTab, devlog?.content, sections]);
+    return `## ${activeTab}\n\nNo entries yet — changes will appear here as you build.`;
+  }, [activeTab, sections]);
 
   return (
     <section className="panel space-y-5">
@@ -34,7 +42,7 @@ export function DevLogPanel({ devlog, todos }) {
           <h2 className="section-title">Project memory that updates while we build.</h2>
         </div>
         <span className="rounded-full border border-ink/10 bg-white px-4 py-2 text-sm text-ink/60">
-          Updated {formatRelativeTime(devlog?.lastUpdated ?? null)}
+          Updated {formatRelativeTime(devlog?.lastUpdated ?? devlog?.last_updated ?? null)}
         </span>
       </div>
 

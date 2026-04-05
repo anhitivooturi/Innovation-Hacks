@@ -1,13 +1,10 @@
 {
   "mcpServers": {
     "devlog": {
-      "type": "http", 
-      "url": "http://localhost:8000",
-      "tools": [
-        "log_decision",
-        "get_project_context",
-        "flag_danger_zone"
-      ]
+      "type": "http",
+      "url": "https://devlog-backend-980285509584.us-central1.run.app/mcp",
+      "name": "devlog",
+      "description": "DevLog AI - project memory for AI coding tools"
     }
   }
 }

@@ -403,7 +403,7 @@ if __name__ == "__main__":
     watch_path = os.getenv("DEVLOG_WATCH_PATH", ".")  # Current directory by default
     api_url = os.getenv(
         "DEVLOG_API_URL",
-        "https://devlog-backend-130030203761.us-central1.run.app/change"  # Cloud Run endpoint
+        "https://devlog-backend-980285509584.us-central1.run.app/change"  # Cloud Run endpoint
     )
 
     print(f"📍 Using API URL: {api_url}")

@@ -4,6 +4,24 @@ import {
   getClassificationClasses,
 } from '../lib/formatters';
 
+// Map classification to border color
+function getClassificationBorderColor(classification) {
+  switch (classification) {
+    case 'feature':
+      return 'border-l-moss';
+    case 'breaking':
+      return 'border-l-clay';
+    case 'fix':
+      return 'border-l-marine';
+    case 'config':
+      return 'border-l-gold';
+    case 'refactor':
+      return 'border-l-plum';
+    default:
+      return 'border-l-ink/20';
+  }
+}
+
 export function TimelinePanel({ entries }) {
   return (
     <section className="panel space-y-5">
@@ -34,15 +52,16 @@ export function TimelinePanel({ entries }) {
           entries.map((entry) => (
           <article
             key={entry.id}
-            className="relative ml-10 rounded-[28px] border border-ink/10 bg-white/80 p-5 shadow-panel animate-rise"
+            className={`relative ml-10 rounded-[28px] border border-ink/10 bg-white/80 p-5 shadow-panel animate-rise border-l-4 ${getClassificationBorderColor(entry.classification)} transition-transform hover:-translate-y-0.5`}
           >
             <span className="absolute -left-[34px] top-5 flex h-4 w-4 items-center justify-center rounded-full border-4 border-sand bg-clay" />
             <div className="flex flex-wrap items-center gap-3">
               <span
-                className={`rounded-full px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] ${getClassificationClasses(
+                className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] ${getClassificationClasses(
                   entry.classification,
                 )}`}
               >
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-current"></span>
                 {entry.classification}
               </span>
               <span className="inline-flex items-center gap-2 text-xs text-ink/50">

@@ -21,13 +21,13 @@ try:
     # Initialize Vertex AI client (NO API keys)
     genai_client = genai.Client(
         vertexai=True,
-        project="devlog-vibhor-gemini",
+        project="innovation-hacks-e6bee",
         location="us-central1"
     )
 
     GEMINI_AVAILABLE = True
     print("✅ Gemini 2.5 Flash initialized via Vertex AI")
-    print("📍 Project: devlog-vibhor-gemini")
+    print("📍 Project: innovation-hacks-e6bee")
     print("📍 Location: us-central1")
 
 except ImportError as e:
