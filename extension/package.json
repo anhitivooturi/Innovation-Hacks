@@ -1,0 +1,137 @@
+{
+  "name": "devlog-ai-vscode",
+  "displayName": "DevLog AI",
+  "description": "Visual and textual project explanations powered by DevLog AI.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "icon": "media/devlog.svg",
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:devlogExplorer",
+    "onCommand:devlog.openPanel",
+    "onCommand:devlog.explainCurrentFile",
+    "onCommand:devlog.explainSelection",
+    "onCommand:devlog.showDependencyDiagram",
+    "onCommand:devlog.showFlowDiagram",
+    "onCommand:devlog.showClassDiagram",
+    "onCommand:devlog.showArchitectureMap",
+    "onCommand:devlog.searchCode",
+    "onCommand:devlog.refreshPanel"
+  ],
+  "main": "./src/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "DevLog AI",
+      "properties": {
+        "devlog.apiBaseUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8000",
+          "description": "Base URL for the DevLog API."
+        },
+        "devlog.projectId": {
+          "type": "string",
+          "default": "default",
+          "description": "Project identifier sent to the DevLog backend."
+        },
+        "devlog.showStatusBar": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether to show the DevLog status bar shortcut."
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "devlog",
+          "title": "DevLog",
+          "icon": "media/devlog.svg"
+        }
+      ]
+    },
+    "views": {
+      "devlog": [
+        {
+          "id": "devlogExplorer",
+          "name": "Project Copilot"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "devlogExplorer",
+        "contents": "Use the commands below to explain the active file or generate project diagrams.\n[Open DevLog Panel](command:devlog.openPanel)"
+      }
+    ],
+    "commands": [
+      {
+        "command": "devlog.openPanel",
+        "title": "DevLog: Open Project Copilot"
+      },
+      {
+        "command": "devlog.explainCurrentFile",
+        "title": "DevLog: Explain Current File"
+      },
+      {
+        "command": "devlog.explainSelection",
+        "title": "DevLog: Explain Selection"
+      },
+      {
+        "command": "devlog.showDependencyDiagram",
+        "title": "DevLog: Show Dependency Diagram"
+      },
+      {
+        "command": "devlog.showFlowDiagram",
+        "title": "DevLog: Show Flow Diagram"
+      },
+      {
+        "command": "devlog.showClassDiagram",
+        "title": "DevLog: Show Class Diagram"
+      },
+      {
+        "command": "devlog.showArchitectureMap",
+        "title": "DevLog: Show Architecture Map"
+      },
+      {
+        "command": "devlog.searchCode",
+        "title": "DevLog: Search Code"
+      },
+      {
+        "command": "devlog.refreshPanel",
+        "title": "DevLog: Refresh Panel"
+      }
+    ],
+    "menus": [
+      {
+        "command": "devlog.explainCurrentFile",
+        "when": "view == devlogExplorer",
+        "group": "navigation@1"
+      },
+      {
+        "command": "devlog.showArchitectureMap",
+        "when": "view == devlogExplorer",
+        "group": "navigation@2"
+      },
+      {
+        "command": "devlog.searchCode",
+        "when": "view == devlogExplorer",
+        "group": "navigation@3"
+      },
+      {
+        "command": "devlog.refreshPanel",
+        "when": "view == devlogExplorer",
+        "group": "navigation@4"
+      }
+    ]
+  },
+  "scripts": {
+    "lint": "node --check src/extension.js",
+    "package": "echo \"Package with vsce if needed\""
+  }
+}
